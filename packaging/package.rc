@@ -1,0 +1,26 @@
+#include <windows.h>
+1 RT_MANIFEST "../assets/rustart.manifest"
+101 ICON "../assets/rustart.ico"
+RUSTART_LICENSE RCDATA "../LICENSE"
+1 VERSIONINFO
+FILEVERSION RUSTART_VERSION_NUMERIC
+PRODUCTVERSION RUSTART_VERSION_NUMERIC
+FILEOS VOS_NT_WINDOWS32
+FILETYPE VFT_APP
+BEGIN
+    BLOCK "StringFileInfo"
+    BEGIN
+        BLOCK "040904B0"
+        BEGIN
+            VALUE "FileDescription", "Rustart application launcher"
+            VALUE "FileVersion", RUSTART_VERSION_TEXT
+            VALUE "OriginalFilename", "rustart.exe"
+            VALUE "ProductName", "Rustart"
+            VALUE "ProductVersion", RUSTART_VERSION_TEXT
+        END
+    END
+    BLOCK "VarFileInfo"
+    BEGIN
+        VALUE "Translation", 0x409, 1200
+    END
+END
