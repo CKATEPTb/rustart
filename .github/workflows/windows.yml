@@ -53,8 +53,8 @@ jobs:
               throw "$path has incorrect version resources for $version."
             }
           }
-      - name: Test packaged command-line behavior
-        run: ./tests/release-package.ps1
+      - name: Test packaged CLI and installation without a terminal
+        run: ./tests/release-package.ps1 -CheckCleanInstall
 
       - name: Identify the release binary
         if: github.event_name == 'push' && github.ref == 'refs/heads/production'
