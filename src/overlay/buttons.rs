@@ -2,12 +2,14 @@ use std::{cell::Cell, ptr::null_mut};
 
 use windows_sys::{
     Win32::{
-        Foundation::{HINSTANCE, HWND},
-        Graphics::Gdi::InvalidateRect,
+        Foundation::{HINSTANCE, HWND, LPARAM, LRESULT, RECT, WPARAM},
+        Graphics::Gdi::{
+            GetStockObject, InflateRect, InvalidateRect, MapWindowPoints, NULL_BRUSH, ValidateRect,
+        },
         UI::{
             Controls::*,
             Input::KeyboardAndMouse::{SetFocus, TME_LEAVE, TRACKMOUSEEVENT, TrackMouseEvent},
-            Shell::SetWindowSubclass,
+            Shell::{DefSubclassProc, SetWindowSubclass},
             WindowsAndMessaging::*,
         },
     },
@@ -30,6 +32,17 @@ pub(super) enum Kind {
 }
 
 impl Kind {
+    pub(super) const APP: [Self; 3] = [Self::Open, Self::Elevated, Self::Folder];
+
+    pub(super) fn id(self, slot: usize) -> usize {
+        match self {
+            Self::Open => FIRST + slot * 3,
+            Self::Elevated => FIRST + slot * 3 + 1,
+            Self::Folder => FIRST + slot * 3 + 2,
+            Self::Copy => COPY,
+        }
+    }
+
     fn name(self) -> PCWSTR {
         wide(match self {
             Self::Open => ControlLabel::ActionOpen,
@@ -49,10 +62,7 @@ pub(super) fn id_action(id: usize) -> (usize, Kind) {
         return (0, Kind::Copy);
     }
     let number = id - FIRST;
-    (
-        number / 3,
-        [Kind::Open, Kind::Elevated, Kind::Folder][number % 3],
-    )
+    (number / 3, Kind::APP[number % 3])
 }
 
 pub(super) struct Buttons {
@@ -85,7 +95,7 @@ impl Buttons {
             .map(|(offset, button)| (FIRST + offset, button.get()))
     }
 
-    pub(super) fn create(&self, owner: HWND, module: HINSTANCE) -> bool {
+    pub(super) fn create(&self, owner: HWND, list: HWND, module: HINSTANCE) -> bool {
         unsafe {
             // Tooltips are owned by the overlay and destroyed with it.
             let tooltip = CreateWindowExW(
@@ -118,7 +128,7 @@ impl Buttons {
                     0,
                     0,
                     0,
-                    owner,
+                    list,
                     id as _,
                     module,
                     null_mut(),
@@ -130,7 +140,7 @@ impl Buttons {
                 }
                 handle.set(button);
                 if !tooltip.is_null() {
-                    let tool = tooltip_info(owner, button, label);
+                    let tool = tooltip_info(list, button, label);
                     SendMessageW(tooltip, TTM_ADDTOOLW, 0, (&raw const tool) as isize);
                 }
             }
@@ -138,7 +148,7 @@ impl Buttons {
         }
     }
 
-    pub(super) fn refresh_language(&self, owner: HWND) {
+    pub(super) fn refresh_language(&self, list: HWND) {
         let tooltip = self.tooltip.get();
         unsafe {
             if !tooltip.is_null() {
@@ -148,7 +158,7 @@ impl Buttons {
                 let label = id_action(id).1.name();
                 SetWindowTextW(button, label);
                 if !tooltip.is_null() {
-                    let tool = tooltip_info(owner, button, label);
+                    let tool = tooltip_info(list, button, label);
                     SendMessageW(tooltip, TTM_UPDATETIPTEXTW, 0, (&raw const tool) as isize);
                 }
             }
@@ -169,9 +179,9 @@ impl Buttons {
             if TrackMouseEvent(&mut event) != 0 {
                 let previous = self.hot.replace(hwnd);
                 if !previous.is_null() {
-                    InvalidateRect(previous, null_mut(), 0);
+                    invalidate_action(previous);
                 }
-                InvalidateRect(hwnd, null_mut(), 0);
+                invalidate_action(hwnd);
             }
         }
     }
@@ -182,6 +192,66 @@ impl Buttons {
             unsafe {
                 InvalidateRect(hwnd, null_mut(), 0);
             }
+        }
+    }
+}
+
+pub(super) fn paint_message(
+    state: &State,
+    hwnd: HWND,
+    id: usize,
+    message: u32,
+    wp: WPARAM,
+    lp: LPARAM,
+) -> Option<LRESULT> {
+    unsafe {
+        if hwnd == state.list.get() {
+            match message {
+                WM_DRAWITEM => {
+                    let item = (lp as *const DRAWITEMSTRUCT).as_ref()?;
+                    let button = state.buttons.get(wp)?;
+                    if button == item.hwndItem {
+                        invalidate_action(button);
+                        return Some(1);
+                    }
+                }
+                WM_CTLCOLORBTN if state.buttons.iter().any(|(_, button)| button == lp as HWND) => {
+                    return Some(GetStockObject(NULL_BRUSH) as LRESULT);
+                }
+                _ => {}
+            }
+        }
+        if !is_button(id) {
+            return None;
+        }
+        // Native buttons supply interaction and accessibility. The list owns
+        // their pixels so scrolling and selection repaint the entire row.
+        match message {
+            WM_PAINT => {
+                ValidateRect(hwnd, null_mut());
+                Some(0)
+            }
+            WM_ERASEBKGND => Some(1),
+            WM_PRINT | WM_PRINTCLIENT => Some(0),
+            WM_SETFOCUS | WM_KILLFOCUS | WM_CAPTURECHANGED | BM_SETSTATE => {
+                let result = DefSubclassProc(hwnd, message, wp, lp);
+                invalidate_action(hwnd);
+                Some(result)
+            }
+            _ => None,
+        }
+    }
+}
+
+fn invalidate_action(hwnd: HWND) {
+    unsafe {
+        let list = GetParent(hwnd);
+        let mut rect = RECT::default();
+        if !list.is_null() && GetWindowRect(hwnd, &mut rect) != 0 {
+            MapWindowPoints(null_mut(), list, (&raw mut rect).cast(), 2);
+            // A region completely covered by a child does not invalidate its parent.
+            InflateRect(&mut rect, 1, 1);
+            InvalidateRect(list, &rect, 0);
         }
     }
 }

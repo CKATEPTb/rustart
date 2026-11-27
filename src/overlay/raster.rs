@@ -117,6 +117,29 @@ impl Canvas<'_> {
         edge: Option<COLORREF>,
     ) {
         let inset = if edge.is_some() { 0.6 } else { 0.0 };
+        self.rounded_path(bounds, radius, inset, face, edge);
+    }
+
+    pub(super) fn rounded_frame(
+        &self,
+        bounds: RECT,
+        radius: f32,
+        thickness: f32,
+        face: COLORREF,
+        edge: COLORREF,
+    ) {
+        self.rounded_path(bounds, radius, 0.0, edge, None);
+        self.rounded_path(bounds, (radius - thickness).max(0.0), thickness, face, None);
+    }
+
+    fn rounded_path(
+        &self,
+        bounds: RECT,
+        radius: f32,
+        inset: f32,
+        face: COLORREF,
+        edge: Option<COLORREF>,
+    ) {
         let x = bounds.left as f32 + inset;
         let y = bounds.top as f32 + inset;
         let right = bounds.right as f32 - inset;
@@ -422,6 +445,30 @@ mod tests {
                 let shape = antialiased(&|canvas| {
                     canvas.rounded(bounds, 11.0 * scale, 0x00ff_ffff, None);
                 });
+                antialiased(&|canvas| {
+                    canvas.rounded_frame(bounds, 16.0 * scale, scale, 0, 0x00ff_ffff);
+                });
+                let outline_pixels =
+                    std::slice::from_raw_parts(data.cast::<u32>(), (SIZE * SIZE) as usize);
+                let center = (bounds.left + bounds.right) / 2;
+                let edge_coverage = [0, 1, 2].map(|offset| {
+                    outline_pixels[((bounds.top + offset) * SIZE + center) as usize] & 0xff
+                });
+                let corner_size = (16.0 * scale).round() as i32;
+                let outline_corners = [
+                    (bounds.left, bounds.top),
+                    (bounds.right - corner_size, bounds.top),
+                    (bounds.left, bounds.bottom - corner_size),
+                    (bounds.right - corner_size, bounds.bottom - corner_size),
+                ]
+                .into_iter()
+                .all(|(left, top)| {
+                    (top + 2..top + corner_size - 2).any(|y| {
+                        (left + 2..left + corner_size - 2).any(|x| {
+                            (1..255).contains(&(outline_pixels[(y * SIZE + x) as usize] & 0xff))
+                        })
+                    })
+                });
                 let glyphs = [
                     (Symbol::Search, 23.0),
                     (Symbol::Copy, 21.0),
@@ -544,6 +591,14 @@ mod tests {
                 DeleteObject(dib);
                 DeleteDC(dc);
                 assert!(shape, "rounded fill at {dpi} DPI");
+                assert!(outline_corners, "rounded outline corners at {dpi} DPI");
+                assert_eq!(edge_coverage[0], 255, "aligned outline at {dpi} DPI");
+                assert_eq!(edge_coverage[2], 0, "outline width at {dpi} DPI");
+                let coverage = edge_coverage.into_iter().sum::<u32>();
+                assert!(
+                    (coverage as f32 - 255.0 * scale).abs() <= 1.0,
+                    "one DIP of outline coverage at {dpi} DPI: {coverage}"
+                );
                 assert!(
                     glyphs.into_iter().all(|has_antialias| has_antialias),
                     "search, copy, calculator and fallback symbols at {dpi} DPI: {glyphs:?}"

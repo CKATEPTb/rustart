@@ -21,6 +21,7 @@ public static class DesktopProbe
     [DllImport("user32")] private static extern bool PrintWindow(IntPtr hwnd, IntPtr dc, uint flags);
     [DllImport("user32")] private static extern uint GetDpiForWindow(IntPtr hwnd);
     [DllImport("user32")] private static extern int GetWindowRgn(IntPtr hwnd, IntPtr region);
+    [DllImport("dwmapi")] private static extern int DwmGetWindowAttribute(IntPtr hwnd, int attribute, out int value, int size);
     [DllImport("user32", CharSet = CharSet.Unicode)] private static extern int GetClassName(IntPtr hwnd, StringBuilder name, int capacity);
     [DllImport("user32")] private static extern bool SystemParametersInfoW(uint action, uint size, ref HighContrast value, uint flags);
     [DllImport("gdi32")] private static extern IntPtr CreateRectRgn(int left, int top, int right, int bottom);
@@ -108,9 +109,15 @@ public static class DesktopProbe
         GetClassName(hwnd, cls, cls.Capacity);
         string name = cls.ToString();
         if (name == "Rustart.Overlay") {
-            // Match the rounded region diameter in src/overlay/view.rs.
-            double diameter = (44 * dpi + 48) / 96;
-            return hasRegion ? Math.Min(diameter, Math.Min(width, height)) / 2 : 0;
+            if (hasRegion) {
+                // Match the fallback region diameter in src/overlay/view.rs.
+                double diameter = (44 * dpi + 48) / 96;
+                return Math.Min(diameter, Math.Min(width, height)) / 2;
+            }
+            // PrintWindow omits the desktop compositor's rounded clip.
+            int preference;
+            return DwmGetWindowAttribute(hwnd, 33, out preference, sizeof(int)) >= 0 && preference == 2
+                ? Math.Min(8 * dpi / 96.0, Math.Min(width, height) / 2.0) : 0;
         }
         if (name != "Rustart.TrayMenu")
             throw new InvalidOperationException("Unsupported Rustart screenshot window.");

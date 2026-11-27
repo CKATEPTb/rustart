@@ -20,7 +20,7 @@ use super::{
     Results, State, VISIBLE_ROWS,
     buttons::{Kind, id_action},
     ensure_selection_visible,
-    raster::{Renderer, Symbol},
+    raster::{Canvas, Renderer, Symbol},
     wide,
 };
 
@@ -41,6 +41,7 @@ const ROW_ICON_LEFT: i32 = 16;
 const ROW_TEXT_LEFT: i32 = 68;
 const ACTION_RIGHT_INSET: i32 = 17;
 const CONTENT_ACTION_GAP: i32 = 10;
+const QUERY_FONT_DIP: i32 = 20;
 const TITLE_FONT_DIP: i32 = 17;
 const DETAIL_FONT_DIP: i32 = 13;
 const ANSWER_FONT_DIP: i32 = 29;
@@ -172,6 +173,7 @@ impl Colors {
 pub(super) struct Appearance {
     colors: Colors,
     dpi: u32,
+    native_corners: bool,
     renderer: OnceCell<Rc<Renderer>>,
     input_brush: HBRUSH,
     background_brush: HBRUSH,
@@ -183,18 +185,24 @@ pub(super) struct Appearance {
 
 impl Appearance {
     pub(super) fn new(dpi: u32) -> Self {
-        Self::themed(dpi, Colors::system(), OnceCell::new())
+        Self::themed(dpi, Colors::system(), OnceCell::new(), false)
     }
 
-    fn themed(dpi: u32, colors: Colors, renderer: OnceCell<Rc<Renderer>>) -> Self {
+    fn themed(
+        dpi: u32,
+        colors: Colors,
+        renderer: OnceCell<Rc<Renderer>>,
+        native_corners: bool,
+    ) -> Self {
         let font = |dip, weight| overlay_font(dpi, dip, weight);
         Self {
             input_brush: unsafe { CreateSolidBrush(colors.input) },
             background_brush: unsafe { CreateSolidBrush(colors.background) },
             colors,
             dpi,
+            native_corners,
             renderer,
-            query: font(20, FW_NORMAL as i32),
+            query: font(QUERY_FONT_DIP, FW_NORMAL as i32),
             answer: font(ANSWER_FONT_DIP, FW_NORMAL as i32),
             title: font(TITLE_FONT_DIP, FW_NORMAL as i32),
             detail: font(DETAIL_FONT_DIP, FW_NORMAL as i32),
@@ -290,7 +298,11 @@ pub(super) fn update_appearance(hwnd: HWND, state: &State) {
         });
         let colors = Colors::system();
         let dark = i32::from(colors.dark);
-        let corner = DWMWCP_DONOTROUND;
+        let corner = if colors.high_contrast {
+            DWMWCP_DONOTROUND
+        } else {
+            DWMWCP_ROUND
+        };
         DwmSetWindowAttribute(
             hwnd,
             DWMWA_USE_IMMERSIVE_DARK_MODE as u32,
@@ -307,15 +319,20 @@ pub(super) fn update_appearance(hwnd: HWND, state: &State) {
         } else if !colors.translucent && style & layered != 0 {
             SetWindowLongPtrW(hwnd, GWL_EXSTYLE, style & !layered);
         }
-        // A single native region defines both clipping and the hit shape.
-        // Suppress DWM's preset radius and border so the client can match it.
-        DwmSetWindowAttribute(
+        // DWM only rounds windows without a region. Keep a region as the
+        // fallback on Windows versions that do not support the preference.
+        let native_corners = DwmSetWindowAttribute(
             hwnd,
             DWMWA_WINDOW_CORNER_PREFERENCE as u32,
             (&raw const corner).cast(),
             size_of_val(&corner) as u32,
-        );
-        let border = DWMWA_COLOR_NONE;
+        ) >= 0
+            && !colors.high_contrast;
+        let border = if native_corners {
+            blend(colors.background, colors.border, 65)
+        } else {
+            DWMWA_COLOR_NONE
+        };
         DwmSetWindowAttribute(
             hwnd,
             DWMWA_BORDER_COLOR as u32,
@@ -324,14 +341,16 @@ pub(super) fn update_appearance(hwnd: HWND, state: &State) {
         );
         let matches = {
             let current = state.appearance.borrow();
-            current.dpi == dpi && current.colors == colors
+            current.dpi == dpi
+                && current.colors == colors
+                && current.native_corners == native_corners
         };
         if matches {
             let font = state.appearance.borrow().query;
             SendMessageW(state.edit.get(), WM_SETFONT, font as usize, 1);
         } else {
             let renderer = state.appearance.borrow().renderer.clone();
-            let appearance = Appearance::themed(dpi, colors, renderer);
+            let appearance = Appearance::themed(dpi, colors, renderer, native_corners);
             SendMessageW(state.edit.get(), WM_SETFONT, appearance.query as usize, 1);
             drop(state.appearance.replace(appearance));
         }
@@ -377,7 +396,7 @@ pub(super) fn layout(hwnd: HWND, state: &State) {
             SelectObject(dc, old);
         }
         ReleaseDC(edit, dc);
-        let line_height = metrics.tmHeight.max(p(20));
+        let line_height = metrics.tmHeight.max(p(QUERY_FONT_DIP));
         let edit_y = (p(INSET) + p(INSET + INPUT) - line_height) / 2;
         SetWindowPos(
             hwnd,
@@ -388,11 +407,13 @@ pub(super) fn layout(hwnd: HWND, state: &State) {
             height,
             SWP_NOACTIVATE | SWP_NOZORDER,
         );
-        let diameter = if state.appearance.borrow().colors.high_contrast {
+        let appearance = state.appearance.borrow();
+        let diameter = if appearance.colors.high_contrast || appearance.native_corners {
             0
         } else {
             p(FRAME_RADIUS * 2).min(width).min(height)
         };
+        drop(appearance);
         let shape = (width, height, diameter);
         if state.shape.get() != shape {
             let applied = if diameter == 0 {
@@ -475,60 +496,93 @@ pub(super) fn top_index(state: &State) -> usize {
     unsafe { SendMessageW(state.list.get(), LB_GETTOPINDEX, 0, 0).max(0) as usize }
 }
 
+fn action_rect(row: RECT, g: Geometry, kind: Kind) -> RECT {
+    let size = g.px(if kind == Kind::Copy {
+        COPY_SIZE
+    } else {
+        APP_ACTION_SIZE
+    });
+    let left = match kind {
+        Kind::Copy => copy_left(row.right, g),
+        Kind::Open => app_action_left(row.left, row.right, g, 0),
+        Kind::Elevated => app_action_left(row.left, row.right, g, 1),
+        Kind::Folder => app_action_left(row.left, row.right, g, 2),
+    };
+    let top = (row.top + row.bottom - g.px(ROW_GAP) - size) / 2;
+    RECT {
+        left,
+        right: left + size,
+        top,
+        bottom: top + size,
+    }
+}
+
 pub(super) fn layout_buttons(hwnd: HWND, state: &State) {
     let g = state.geometry.get();
-    let p = |n| g.px(n);
     let count = state.count();
     let top = top_index(state);
     state.request_icons(top);
-    if state.view_top.replace(top) != top {
+    let top_changed = state.view_top.replace(top) != top;
+    if top_changed {
         state.renew_rows();
+        invalidate_rail(hwnd, state);
     }
+    let mut repaint = top_changed;
     let calc = state.is_calculation();
+    let list = state.list.get();
     unsafe {
         let mut area = RECT::default();
-        GetClientRect(hwnd, &mut area);
-        let list_left = p(INSET);
-        let list_right = list_left + list_width(area.right, g, count);
+        GetClientRect(list, &mut area);
+        let height = g.px(ROW);
         for (id, button) in state.buttons.iter() {
             let (slot, kind) = id_action(id);
+            let visible = GetWindowLongPtrW(button, GWL_STYLE) as u32 & WS_VISIBLE != 0;
             let should_show = top + slot < count && (kind == Kind::Copy) == calc;
-            let flags = GetWindowLongPtrW(button, GWL_STYLE) as u32;
+            let flags = SWP_NOACTIVATE | SWP_NOZORDER | SWP_NOREDRAW;
             if !should_show {
-                if flags & WS_VISIBLE != 0 {
+                if visible {
                     if GetFocus() == button {
                         SetFocus(state.edit.get());
                     }
-                    ShowWindow(button, SW_HIDE);
+                    state.buttons.leave(button);
+                    SetWindowPos(
+                        button,
+                        null_mut(),
+                        0,
+                        0,
+                        0,
+                        0,
+                        flags | SWP_NOMOVE | SWP_NOSIZE | SWP_HIDEWINDOW,
+                    );
+                    repaint = true;
                 }
                 continue;
             }
-            let column = match kind {
-                Kind::Open => 0,
-                Kind::Elevated => 1,
-                Kind::Folder | Kind::Copy => 2,
+            let row = RECT {
+                top: slot as i32 * height,
+                bottom: (slot as i32 + 1) * height,
+                ..area
             };
-            let (left, size) = if kind == Kind::Copy {
-                (copy_left(list_right, g), p(COPY_SIZE))
-            } else {
-                (
-                    app_action_left(list_left, list_right, g, column),
-                    p(APP_ACTION_SIZE),
-                )
-            };
-            let y = (p(ROW) - p(ROW_GAP) - size) / 2;
-            SetWindowPos(
-                button,
-                HWND_TOP,
-                left,
-                p(INSET + INPUT + GAP) + slot as i32 * p(ROW) + y,
-                size,
-                size,
-                SWP_NOACTIVATE | SWP_SHOWWINDOW,
-            );
-            InvalidateRect(button, null_mut(), 0);
+            let target = action_rect(row, g, kind);
+            let mut current = RECT::default();
+            GetWindowRect(button, &mut current);
+            MapWindowPoints(null_mut(), list, (&raw mut current).cast(), 2);
+            if !visible || EqualRect(&current, &target) == 0 {
+                SetWindowPos(
+                    button,
+                    null_mut(),
+                    target.left,
+                    target.top,
+                    target.right - target.left,
+                    target.bottom - target.top,
+                    flags | SWP_SHOWWINDOW,
+                );
+                repaint = true;
+            }
         }
-        InvalidateRect(hwnd, null_mut(), 0);
+        if repaint {
+            InvalidateRect(list, null_mut(), 0);
+        }
     }
 }
 
@@ -580,13 +634,24 @@ pub(super) fn draw_dark_edit_cue(edit: HWND, dc: HDC, state: &State) {
             // Keep the real EDIT banner as the source of the text. Replace
             // only the pixels where the native cue uses the dim system ink.
             fill(dc, client, appearance.colors.input);
-            text_gdi(
-                dc,
-                text,
-                &cue[..=end],
-                appearance.query,
-                appearance.colors.secondary,
-            );
+            let size = QUERY_FONT_DIP as f32 * appearance.dpi as f32 / 96.0;
+            let smoothed = appearance.renderer().canvas(dc).is_some_and(|canvas| {
+                // The default GDI+ string format includes a small overhang margin.
+                let bounds = RECT {
+                    left: text.left - (size / 6.0).round() as i32,
+                    ..text
+                };
+                canvas.text(bounds, &cue[..end], size, appearance.colors.secondary)
+            });
+            if !smoothed {
+                text_gdi(
+                    dc,
+                    text,
+                    &cue[..=end],
+                    appearance.query,
+                    appearance.colors.secondary,
+                );
+            }
             RestoreDC(dc, saved);
         }
     }
@@ -596,10 +661,83 @@ pub(super) fn list_brush(state: &State) -> HBRUSH {
     state.appearance.borrow().background_brush
 }
 
+pub(super) fn paint_list(list: HWND, state: &State) {
+    paint_buffered(list, |dc, dirty| unsafe {
+        // Keep native list geometry and owner-draw notifications.
+        FillRect(dc, &dirty, list_brush(state));
+        SendMessageW(list, WM_PRINTCLIENT, dc as usize, PRF_CLIENT as isize);
+    });
+}
+
+fn paint_buffered(hwnd: HWND, draw: impl FnOnce(HDC, RECT)) {
+    unsafe {
+        let mut ps = PAINTSTRUCT::default();
+        let dc = BeginPaint(hwnd, &mut ps);
+        let dirty = ps.rcPaint;
+        if !dc.is_null() && dirty.right > dirty.left && dirty.bottom > dirty.top {
+            let mut client = RECT::default();
+            GetClientRect(hwnd, &mut client);
+            let memory = CreateCompatibleDC(dc);
+            let bitmap = if memory.is_null() {
+                null_mut()
+            } else {
+                CreateCompatibleBitmap(dc, client.right, client.bottom)
+            };
+            let previous = if bitmap.is_null() {
+                null_mut()
+            } else {
+                SelectObject(memory, bitmap)
+            };
+            let buffered = !previous.is_null();
+            let target = if buffered {
+                IntersectClipRect(memory, dirty.left, dirty.top, dirty.right, dirty.bottom);
+                memory
+            } else {
+                dc
+            };
+
+            draw(target, dirty);
+            if buffered {
+                BitBlt(
+                    dc,
+                    dirty.left,
+                    dirty.top,
+                    dirty.right - dirty.left,
+                    dirty.bottom - dirty.top,
+                    memory,
+                    dirty.left,
+                    dirty.top,
+                    SRCCOPY,
+                );
+                SelectObject(memory, previous);
+            }
+            if !bitmap.is_null() {
+                DeleteObject(bitmap);
+            }
+            if !memory.is_null() {
+                DeleteDC(memory);
+            }
+        }
+        EndPaint(hwnd, &ps);
+    }
+}
+
 pub(super) fn hits_input(state: &State, point: isize) -> bool {
     let y = i32::from((point >> 16) as i16);
     let g = state.geometry.get();
     (g.px(INSET)..g.px(INSET) + g.px(INPUT)).contains(&y)
+}
+
+pub(super) fn invalidate_rail(hwnd: HWND, state: &State) {
+    let g = state.geometry.get();
+    unsafe {
+        let mut rail = RECT::default();
+        if GetClientRect(hwnd, &mut rail) != 0 {
+            rail.left = (rail.right - g.px(INSET) - g.px(8)).max(0);
+            rail.top = g.px(INSET + INPUT + GAP);
+            InvalidateRect(hwnd, &rail, 0);
+        }
+    }
 }
 
 fn fill(dc: HDC, r: RECT, color: COLORREF) {
@@ -635,12 +773,10 @@ fn text_gdi(dc: HDC, mut area: RECT, value: &[u16], font: HFONT, color: COLORREF
 }
 
 pub(super) fn paint(hwnd: HWND, state: &State) {
-    unsafe {
+    paint_buffered(hwnd, |dc, _| unsafe {
         let count = state.count();
         let top = top_index(state);
         let focused = GetFocus() == state.edit.get();
-        let mut ps = PAINTSTRUCT::default();
-        let dc = BeginPaint(hwnd, &mut ps);
         let mut rect = RECT::default();
         GetClientRect(hwnd, &mut rect);
         let a = state.appearance.borrow();
@@ -660,9 +796,9 @@ pub(super) fn paint(hwnd: HWND, state: &State) {
         let edge = if colors.high_contrast {
             colors.border
         } else if focused {
-            blend(colors.border, colors.accent, 30)
+            blend(colors.input, colors.accent, 24)
         } else {
-            blend(colors.input, colors.border, 62)
+            blend(colors.input, colors.border, 48)
         };
         if let Some(canvas) = a.renderer().canvas(dc) {
             let radius = |dp: f32| {
@@ -672,15 +808,17 @@ pub(super) fn paint(hwnd: HWND, state: &State) {
                     g.scale(dp)
                 }
             };
-            if !colors.high_contrast {
-                canvas.rounded(
-                    rect,
-                    radius(FRAME_RADIUS as f32),
-                    colors.background,
-                    Some(blend(colors.background, colors.border, 65)),
+            if colors.high_contrast {
+                canvas.rounded(input, 0.0, colors.input, Some(edge));
+            } else {
+                canvas.rounded_frame(
+                    input,
+                    g.scale(INPUT_RADIUS),
+                    g.scale(1.0),
+                    colors.input,
+                    edge,
                 );
             }
-            canvas.rounded(input, radius(INPUT_RADIUS), colors.input, Some(edge));
             let search = RECT {
                 left: p(INSET + ROW_ICON_LEFT),
                 right: p(INSET + ROW_ICON_LEFT + APP_ICON_DIP),
@@ -711,8 +849,7 @@ pub(super) fn paint(hwnd: HWND, state: &State) {
             fill(dc, input, colors.input);
             frame(dc, input, edge);
         }
-        EndPaint(hwnd, &ps);
-    }
+    });
 }
 
 fn blend(base: COLORREF, tint: COLORREF, percent: u32) -> COLORREF {
@@ -855,6 +992,25 @@ pub(super) fn draw_row(state: &State, item: &DRAWITEMSTRUCT) {
         }
     }
 
+    if let Some(slot) = row
+        .checked_sub(top_index(state))
+        .filter(|&slot| slot < VISIBLE_ROWS)
+        && let Some(canvas) = a.renderer().canvas(dc)
+    {
+        let kinds: &[Kind] = if calculation {
+            &[Kind::Copy]
+        } else if app_index.is_some() {
+            &Kind::APP
+        } else {
+            &[]
+        };
+        for &kind in kinds {
+            if let Some(button) = state.buttons.get(kind.id(slot)) {
+                draw_button(state, colors, &canvas, r, kind, button, selected);
+            }
+        }
+    }
+
     match &*state.results.borrow() {
         Results::Apps(_) => {
             let apps = state.apps.borrow();
@@ -886,22 +1042,22 @@ pub(super) fn draw_row(state: &State, item: &DRAWITEMSTRUCT) {
     }
 }
 
-pub(super) fn draw_button(state: &State, item: &DRAWITEMSTRUCT) {
-    let (slot, kind) = id_action(item.CtlID as usize);
-    let top = top_index(state);
-    let selected =
-        unsafe { SendMessageW(state.list.get(), LB_GETCURSEL, 0, 0) as usize == top + slot };
-    let hot = state.buttons.hot.get() == item.hwndItem;
-    let pressed = item.itemState & ODS_SELECTED != 0;
-    let focused = item.itemState & ODS_FOCUS != 0;
-    let a = state.appearance.borrow();
+fn draw_button(
+    state: &State,
+    colors: &Colors,
+    canvas: &Canvas<'_>,
+    row: RECT,
+    kind: Kind,
+    button: HWND,
+    selected: bool,
+) {
+    let hot = state.buttons.hot.get() == button;
+    let pressed = unsafe { SendMessageW(button, BM_GETSTATE, 0, 0) as u32 & BST_PUSHED != 0 };
+    let focused = unsafe { GetFocus() == button };
     let g = state.geometry.get();
-    let colors = &a.colors;
-    let r = item.rcItem;
-    let dc = item.hDC;
+    let r = action_rect(row, g, kind);
     let background = row_fill(colors, selected);
     let (ink, quiet) = row_ink(colors, selected);
-    fill(dc, r, background);
     let symbol = match kind {
         Kind::Open => Symbol::Open,
         Kind::Elevated => Symbol::Shield,
@@ -916,28 +1072,26 @@ pub(super) fn draw_button(state: &State, item: &DRAWITEMSTRUCT) {
     } else {
         quiet
     };
-    if let Some(canvas) = a.renderer().canvas(dc) {
-        if active {
-            let face = if colors.high_contrast {
-                background
-            } else {
-                blend(background, ink, if pressed { 18 } else { 9 })
-            };
-            let radius = if colors.high_contrast {
-                0.0
-            } else {
-                g.scale(9.0)
-            };
-            let edge = (focused || colors.high_contrast).then_some(mark);
-            canvas.rounded(r, radius, face, edge);
-        }
-        let size = if kind == Kind::Copy {
-            21.0
+    if active {
+        let face = if colors.high_contrast {
+            background
         } else {
-            APP_ACTION_SYMBOL
+            blend(background, ink, if pressed { 18 } else { 9 })
         };
-        canvas.symbol(symbol, r, g.scale(size), mark);
+        let radius = if colors.high_contrast {
+            0.0
+        } else {
+            g.scale(9.0)
+        };
+        let edge = (focused || colors.high_contrast).then_some(mark);
+        canvas.rounded(r, radius, face, edge);
     }
+    let size = if kind == Kind::Copy {
+        21.0
+    } else {
+        APP_ACTION_SYMBOL
+    };
+    canvas.symbol(symbol, r, g.scale(size), mark);
 }
 
 #[cfg(test)]

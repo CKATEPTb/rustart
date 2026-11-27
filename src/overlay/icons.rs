@@ -214,8 +214,9 @@ impl Loader {
             work.notified = false;
             std::mem::take(&mut work.returned)
         };
-        let changed = !returned.is_empty();
+        let mut changed = false;
         for (key, icon) in returned {
+            changed |= icon.is_some() && self.visible.contains(&key);
             self.cache.insert(key, icon);
         }
         changed

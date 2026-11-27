@@ -154,7 +154,7 @@ fn ensure_selection_visible(state: &State) {
     }
 }
 
-#[derive(Default)]
+#[derive(Default, PartialEq, Eq)]
 enum Results {
     #[default]
     Empty,
@@ -401,7 +401,7 @@ unsafe extern "system" fn window_proc(hwnd: HWND, message: u32, wp: WPARAM, lp: 
                     i18n::wide(ControlLabel::OverlayCue) as LPARAM,
                 );
                 SetWindowTextW(state.list.get(), i18n::wide(ControlLabel::OverlayResults));
-                state.buttons.refresh_language(hwnd);
+                state.buttons.refresh_language(state.list.get());
                 InvalidateRect(edit, null_mut(), 0);
             }
             WM_TIMER if wp == RELEASE_VIEW_TIMER => {
@@ -481,18 +481,12 @@ unsafe extern "system" fn window_proc(hwnd: HWND, message: u32, wp: WPARAM, lp: 
                     ValidateRect(hwnd, null_mut());
                 }
             }
-            WM_DRAWITEM
-                if (wp == LIST_ID || buttons::is_button(wp)) && IsWindowVisible(hwnd) != 0 =>
-            {
-                if let Some(item) = (lp as *const DRAWITEMSTRUCT).as_ref() {
-                    if wp == LIST_ID && item.hwndItem == state.list.get() {
-                        view::draw_row(state, item);
-                        return 1;
-                    }
-                    if state.buttons.get(wp) == Some(item.hwndItem) {
-                        view::draw_button(state, item);
-                        return 1;
-                    }
+            WM_DRAWITEM if wp == LIST_ID && IsWindowVisible(hwnd) != 0 => {
+                if let Some(item) = (lp as *const DRAWITEMSTRUCT).as_ref()
+                    && item.hwndItem == state.list.get()
+                {
+                    view::draw_row(state, item);
+                    return 1;
                 }
             }
             WM_CTLCOLOREDIT => return view::edit_colors(wp as HDC, state) as LRESULT,
@@ -560,7 +554,7 @@ fn create_controls(hwnd: HWND, state: &State) -> bool {
             return false;
         }
         state.list.set(list);
-        state.buttons.create(hwnd, module)
+        state.buttons.create(hwnd, list, module)
     }
 }
 
@@ -602,6 +596,14 @@ fn show_window(hwnd: HWND, state: &State) {
         ShowWindow(hwnd, SW_SHOW);
         SetForegroundWindow(hwnd);
         SetFocus(state.edit.get());
+        // Initialize the whole popup after it becomes visible. Its layered
+        // surface can otherwise contain only the edit's first dirty rectangle.
+        RedrawWindow(
+            hwnd,
+            null_mut(),
+            null_mut(),
+            RDW_INVALIDATE | RDW_ALLCHILDREN | RDW_UPDATENOW,
+        );
     }
 }
 
@@ -725,38 +727,66 @@ fn refresh_results(hwnd: HWND, state: &State, previous: Option<&Source>) {
         } else {
             Results::Apps(catalog::search(&state.apps.borrow(), query))
         };
-        let mut selected = 0;
-        let names: Vec<Vec<u16>> = match &results {
-            Results::Apps(indices) => {
+        let selected = match (&results, previous) {
+            (Results::Apps(indices), Some(source)) => {
                 let apps = state.apps.borrow();
-                if let Some(source) = previous {
-                    selected = indices
-                        .iter()
-                        .position(|&index| &apps[index].source == source)
-                        .unwrap_or(0);
-                }
                 indices
                     .iter()
-                    .map(|&index| wide(&apps[index].name))
-                    .collect()
+                    .position(|&index| &apps[index].source == source)
+                    .unwrap_or(0)
             }
-            Results::Calculation(value) => vec![wide(value)],
-            _ => Vec::new(),
+            _ => 0,
         };
         let app_query = matches!(results, Results::Apps(_));
         let search_started = !state.app_query_active.replace(app_query) && app_query;
-        state.results.replace(results);
+        let old_count = SendMessageW(list, LB_GETCOUNT, 0, 0).max(0) as usize;
+        let changed = results != *state.results.borrow() || old_count != state.count();
+        let reset_selection =
+            old_count != 0 && SendMessageW(list, LB_GETCURSEL, 0, 0) != selected as isize;
         state.renew_rows();
-        SendMessageW(list, WM_SETREDRAW, 0, 0);
-        SendMessageW(list, LB_RESETCONTENT, 0, 0);
-        for name in &names {
-            SendMessageW(list, LB_ADDSTRING, 0, name.as_ptr() as LPARAM);
+        if changed {
+            let names: Vec<_> = match &results {
+                Results::Apps(indices) => {
+                    let apps = state.apps.borrow();
+                    indices.iter().map(|&i| wide(&apps[i].name)).collect()
+                }
+                Results::Calculation(value) => vec![wide(value)],
+                Results::Empty => Vec::new(),
+            };
+            state.results.replace(results);
+            // Enabling WM_SETREDRAW on a hidden list would make it visible
+            // before layout has positioned it for the new results.
+            let visible = IsWindowVisible(list) != 0;
+            if visible {
+                SendMessageW(list, WM_SETREDRAW, 0, 0);
+            }
+            SendMessageW(list, LB_RESETCONTENT, 0, 0);
+            for name in &names {
+                SendMessageW(list, LB_ADDSTRING, 0, name.as_ptr() as LPARAM);
+            }
+            if !names.is_empty() {
+                SendMessageW(list, LB_SETCURSEL, selected, 0);
+            }
+            if visible {
+                SendMessageW(list, WM_SETREDRAW, 1, 0);
+            }
+            InvalidateRect(list, null_mut(), 0);
+        } else if reset_selection {
+            select_result(state, selected);
         }
-        if !names.is_empty() {
-            SendMessageW(list, LB_SETCURSEL, selected, 0);
+        let count = state.count();
+        // The first three results add height. The fourth reserves the scroll gutter.
+        if IsWindowVisible(hwnd) == 0
+            || old_count.min(VISIBLE_ROWS + 1) != count.min(VISIBLE_ROWS + 1)
+        {
+            view::layout(hwnd, state);
+        } else if changed || reset_selection {
+            ensure_selection_visible(state);
+            view::layout_buttons(hwnd, state);
+            if old_count != count {
+                view::invalidate_rail(hwnd, state);
+            }
         }
-        SendMessageW(list, WM_SETREDRAW, 1, 0);
-        view::layout(hwnd, state);
         if search_started {
             crate::runtime::search_started(hwnd);
         }
@@ -921,19 +951,35 @@ fn navigate(hwnd: HWND, state: &State, delta: isize) {
         }
         let selected = SendMessageW(list, LB_GETCURSEL, 0, 0).max(0);
         let next = (selected + delta).clamp(0, count as isize - 1);
-        if next != selected {
-            state.renew_interaction();
+        if next == selected {
+            return;
         }
-        SendMessageW(list, LB_SETCURSEL, next as usize, 0);
-        ensure_selection_visible(state);
+        state.renew_interaction();
+        select_result(state, next as usize);
         view::layout_buttons(hwnd, state);
+    }
+}
+
+fn select_result(state: &State, index: usize) {
+    let list = state.list.get();
+    unsafe {
+        // LISTBOX normally scrolls pixels already on screen and draws the two
+        // selections synchronously. Present the new viewport in one WM_PAINT.
+        SendMessageW(list, WM_SETREDRAW, 0, 0);
+        SendMessageW(list, LB_SETCURSEL, index, 0);
+        ensure_selection_visible(state);
+        SendMessageW(list, WM_SETREDRAW, 1, 0);
+        InvalidateRect(list, null_mut(), 0);
     }
 }
 
 fn scroll(hwnd: HWND, state: &State, wp: WPARAM) {
     let total = state.wheel.get() + i32::from((wp >> 16) as i16);
     state.wheel.set(total % WHEEL_DELTA as i32);
-    navigate(hwnd, state, (-(total / WHEEL_DELTA as i32)) as isize);
+    let steps = total / WHEEL_DELTA as i32;
+    if steps != 0 {
+        navigate(hwnd, state, -steps as isize);
+    }
 }
 
 unsafe extern "system" fn control_proc(
@@ -951,7 +997,18 @@ unsafe extern "system" fn control_proc(
             RemoveWindowSubclass(hwnd, Some(control_proc), id);
         }
         if let Some(state) = ptr.as_ref() {
+            if let Some(result) = buttons::paint_message(state, hwnd, id, message, wp, lp) {
+                return result;
+            }
             match message {
+                WM_ERASEBKGND if id == LIST_ID => return 1,
+                WM_PAINT if id == LIST_ID && wp == 0 => {
+                    view::paint_list(hwnd, state);
+                    return 0;
+                }
+                WM_COMMAND if id == LIST_ID && buttons::is_button(wp as u16 as usize) => {
+                    return SendMessageW(parent, WM_COMMAND, wp, lp);
+                }
                 WM_MOUSEMOVE if buttons::is_button(id) => state.buttons.hover(hwnd),
                 WM_MOUSELEAVE if buttons::is_button(id) => state.buttons.leave(hwnd),
                 WM_LBUTTONDOWN | WM_LBUTTONDBLCLK if buttons::is_button(id) => {
@@ -1143,13 +1200,13 @@ mod tests {
                 String::from_utf16(&value[..length as usize]).unwrap(),
                 "unchanged"
             );
-            let copy = GetDlgItem(window.0, buttons::COPY as i32);
+            let list = GetDlgItem(window.0, LIST_ID as i32);
+            let copy = GetDlgItem(list, buttons::COPY as i32);
             let length = GetWindowTextW(copy, value.as_mut_ptr(), value.len() as i32);
             assert_eq!(
                 String::from_utf16(&value[..length as usize]).unwrap(),
                 "Ergebnis kopieren"
             );
-            let list = GetDlgItem(window.0, LIST_ID as i32);
             let length = GetWindowTextW(list, value.as_mut_ptr(), value.len() as i32);
             assert_eq!(
                 String::from_utf16(&value[..length as usize]).unwrap(),

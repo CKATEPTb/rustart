@@ -117,7 +117,7 @@ function Record-Key([byte[]]$keys) {
     $probe::Chord($keys)
 }
 function Click-RowAction([int]$id) {
-    $button = $probe::GetDlgItem($overlay, $id)
+    $button = $probe::GetDlgItem($list, $id)
     Require ($probe::CanClick($button)) "Row button $id is hidden or covered."
     $null = $probe::Post($button, 0x00f5, [IntPtr]0, [IntPtr]0)
 }
@@ -294,8 +294,8 @@ try {
         $probe::GetWindowRect($overlay, [ref]$resultBounds) -and
         ($resultBounds.Bottom - $resultBounds.Top) -gt $compactHeight) 'A valid calculation did not expand the launcher.'
     Start-Sleep -Milliseconds 180
-    Require ($probe::CanClick($probe::GetDlgItem($overlay, 119))) 'Calculator copy button is missing.'
-    Require (!($probe::Visible($probe::GetDlgItem($overlay, 110)))) 'Calculator exposes an application action.'
+    Require ($probe::CanClick($probe::GetDlgItem($list, 119))) 'Calculator copy button is missing.'
+    Require (!($probe::Visible($probe::GetDlgItem($list, 110)))) 'Calculator exposes an application action.'
     Capture $overlay 'calculator'
     if ($CheckClipboard) {
         # This optional check writes the known result to the session clipboard.
@@ -319,14 +319,14 @@ try {
     Await-SingleRustartProcess 'visible search with application results and icons'
     Measure-Memory $resident 'Visible search with application results and icons'
     foreach ($id in 110..118) {
-        Require ($probe::CanClick($probe::GetDlgItem($overlay, $id))) "Missing action $id."
+        Require ($probe::CanClick($probe::GetDlgItem($list, $id))) "Missing action $id."
     }
     $listRect = New-Object DesktopProbe+Rect
     $openRect = New-Object DesktopProbe+Rect
     $folderRect = New-Object DesktopProbe+Rect
     $null = $probe::GetWindowRect($list, [ref]$listRect)
-    $null = $probe::GetWindowRect($probe::GetDlgItem($overlay, 110), [ref]$openRect)
-    $null = $probe::GetWindowRect($probe::GetDlgItem($overlay, 112), [ref]$folderRect)
+    $null = $probe::GetWindowRect($probe::GetDlgItem($list, 110), [ref]$openRect)
+    $null = $probe::GetWindowRect($probe::GetDlgItem($list, 112), [ref]$folderRect)
     Require ($openRect.Left -gt ($listRect.Left + $listRect.Right) / 2 -and
         $openRect.Right -lt $folderRect.Left -and $folderRect.Right -le $listRect.Right -and
         ($listRect.Right - $folderRect.Right) -lt ($folderRect.Right - $folderRect.Left)) 'Row actions do not occupy the right edge.'
