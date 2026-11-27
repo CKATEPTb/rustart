@@ -12,7 +12,7 @@ BEGIN
     BEGIN
         BLOCK "040904B0"
         BEGIN
-            VALUE "FileDescription", "Rustart application launcher"
+            VALUE "FileDescription", "rustart.exe"
             VALUE "FileVersion", RUSTART_VERSION_TEXT
             VALUE "OriginalFilename", "rustart.exe"
             VALUE "ProductName", "Rustart"
