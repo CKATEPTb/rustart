@@ -53,9 +53,6 @@ function Capture([IntPtr]$hwnd, [string]$name) {
     Require ($probe::GetForegroundWindow() -eq $hwnd) 'Capture requires a foreground Rustart window.'
     Add-Type -AssemblyName System.Drawing
     $null = New-Item -ItemType Directory -Path $Screenshots -Force
-    $bounds = New-Object DesktopProbe+Rect
-    $null = $probe::GetWindowRect($hwnd, [ref]$bounds)
-    $bmp = New-Object Drawing.Bitmap ($bounds.Right - $bounds.Left), ($bounds.Bottom - $bounds.Top)
     $savedPoint = New-Object DesktopProbe+Point
     $moved = $false
     try {
@@ -69,11 +66,19 @@ function Capture([IntPtr]$hwnd, [string]$name) {
             $null = $probe::Send($edit, 0x00b1, [IntPtr]$end, [IntPtr]$end)
             Start-Sleep -Milliseconds 130
         }
-        $g = [Drawing.Graphics]::FromImage($bmp)
-        try { $g.CopyFromScreen($bounds.Left, $bounds.Top, 0, 0, $bmp.Size) } finally { $g.Dispose() }
-        $bmp.Save((Join-Path $Screenshots "$name.png"))
+        $image = $probe::CaptureWindow($hwnd)
+        $format = [Drawing.Imaging.PixelFormat]::Format32bppArgb
+        $bmp = [Drawing.Bitmap]::new($image.Width, $image.Height, $format)
+        try {
+            $rect = [Drawing.Rectangle]::new(0, 0, $image.Width, $image.Height)
+            $data = $bmp.LockBits($rect, [Drawing.Imaging.ImageLockMode]::WriteOnly, $format)
+            try {
+                Require ($data.Stride -eq $image.Width * 4) 'Unexpected screenshot bitmap layout.'
+                [Runtime.InteropServices.Marshal]::Copy($image.Pixels, 0, $data.Scan0, $image.Pixels.Length)
+            } finally { $bmp.UnlockBits($data) }
+            $bmp.Save((Join-Path $Screenshots "$name.png"), [Drawing.Imaging.ImageFormat]::Png)
+        } finally { $bmp.Dispose() }
     } finally {
-        $bmp.Dispose()
         $currentPoint = New-Object DesktopProbe+Point
         if ($moved -and $probe::GetCursorPos([ref]$currentPoint) -and $currentPoint.X -eq $neutralX -and $currentPoint.Y -eq $neutralY) {
             $null = $probe::SetCursorPos($savedPoint.X, $savedPoint.Y)

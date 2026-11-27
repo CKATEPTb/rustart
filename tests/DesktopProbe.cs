@@ -18,6 +18,155 @@ public static class DesktopProbe
     [DllImport("user32")] public static extern IntPtr GetForegroundWindow();
     [DllImport("user32")] public static extern bool GetWindowRect(IntPtr hwnd, out Rect rect);
     [DllImport("user32")] public static extern bool GetClientRect(IntPtr hwnd, out Rect rect);
+    [DllImport("user32")] private static extern bool PrintWindow(IntPtr hwnd, IntPtr dc, uint flags);
+    [DllImport("user32")] private static extern uint GetDpiForWindow(IntPtr hwnd);
+    [DllImport("user32")] private static extern int GetWindowRgn(IntPtr hwnd, IntPtr region);
+    [DllImport("user32", CharSet = CharSet.Unicode)] private static extern int GetClassName(IntPtr hwnd, StringBuilder name, int capacity);
+    [DllImport("user32")] private static extern bool SystemParametersInfoW(uint action, uint size, ref HighContrast value, uint flags);
+    [DllImport("gdi32")] private static extern IntPtr CreateRectRgn(int left, int top, int right, int bottom);
+    [DllImport("gdi32")] private static extern bool PtInRegion(IntPtr region, int x, int y);
+    [DllImport("gdi32")] private static extern IntPtr CreateCompatibleDC(IntPtr dc);
+    [DllImport("gdi32")] private static extern bool DeleteDC(IntPtr dc);
+    [DllImport("gdi32")] private static extern IntPtr SelectObject(IntPtr dc, IntPtr obj);
+    [DllImport("gdi32")] private static extern bool DeleteObject(IntPtr obj);
+    [DllImport("gdi32")] private static extern bool GdiFlush();
+    [DllImport("gdi32")] private static extern IntPtr CreateDIBSection(IntPtr dc, ref BitmapInfo info,
+        uint usage, out IntPtr bits, IntPtr section, uint offset);
+
+    [StructLayout(LayoutKind.Sequential)]
+    private struct BitmapInfo {
+        public uint Size;
+        public int Width, Height;
+        public ushort Planes, BitsPerPixel;
+        public uint Compression, ImageSize;
+        public int XPelsPerMeter, YPelsPerMeter;
+        public uint ColorsUsed, ImportantColors;
+    }
+
+    [StructLayout(LayoutKind.Sequential)]
+    private struct HighContrast {
+        public uint Size, Flags;
+        public IntPtr Scheme;
+    }
+
+    public sealed class WindowImage {
+        public int Width, Height;
+        public int[] Pixels;
+    }
+
+    public static WindowImage CaptureWindow(IntPtr hwnd) {
+        Rect bounds;
+        if (!Visible(hwnd) || !GetWindowRect(hwnd, out bounds))
+            throw new InvalidOperationException("Could not measure the visible Rustart window.");
+        int width = bounds.Right - bounds.Left, height = bounds.Bottom - bounds.Top;
+        if (width <= 0 || height <= 0)
+            throw new InvalidOperationException("The Rustart window is empty.");
+        uint dpi = GetDpiForWindow(hwnd);
+        if (dpi == 0) throw new InvalidOperationException("Could not read the Rustart window DPI.");
+        var info = new BitmapInfo {
+            Size = (uint)Marshal.SizeOf(typeof(BitmapInfo)), Width = width, Height = -height,
+            Planes = 1, BitsPerPixel = 32
+        };
+        var pixels = new int[checked(width * height)];
+        const int unpainted = 0x110d0211;
+        for (int i = 0; i < pixels.Length; i++) pixels[i] = unpainted;
+        var dc = CreateCompatibleDC(IntPtr.Zero);
+        if (dc == IntPtr.Zero) throw new InvalidOperationException("Could not create the capture DC.");
+        IntPtr bitmap = IntPtr.Zero, previous = IntPtr.Zero;
+        try {
+            IntPtr bits;
+            bitmap = CreateDIBSection(dc, ref info, 0, out bits, IntPtr.Zero, 0);
+            if (bitmap == IntPtr.Zero) throw new InvalidOperationException("Could not create the capture bitmap.");
+            var selected = SelectObject(dc, bitmap);
+            if (selected == IntPtr.Zero || selected == new IntPtr(-1))
+                throw new InvalidOperationException("Could not select the capture bitmap.");
+            previous = selected;
+            Marshal.Copy(pixels, 0, bits, pixels.Length);
+            // PW_RENDERFULLCONTENT requests the window composition, including its child controls.
+            if (!PrintWindow(hwnd, dc, 2) || !GdiFlush())
+                throw new InvalidOperationException("Could not print the Rustart window.");
+            Marshal.Copy(bits, pixels, 0, pixels.Length);
+        } finally {
+            if (previous != IntPtr.Zero) SelectObject(dc, previous);
+            if (bitmap != IntPtr.Zero) DeleteObject(bitmap);
+            DeleteDC(dc);
+        }
+        var region = CreateRectRgn(0, 0, 0, 0);
+        if (region == IntPtr.Zero) throw new InvalidOperationException("Could not allocate the screenshot region.");
+        try {
+            bool hasRegion = GetWindowRgn(hwnd, region) != 0;
+            double radius = CaptureRadius(hwnd, dpi, width, height, hasRegion);
+            ApplyWindowAlpha(pixels, width, height, radius, hasRegion ? region : IntPtr.Zero, unpainted);
+        } finally {
+            DeleteObject(region);
+        }
+        return new WindowImage { Width = width, Height = height, Pixels = pixels };
+    }
+
+    private static double CaptureRadius(IntPtr hwnd, uint dpi, int width, int height, bool hasRegion) {
+        var cls = new StringBuilder(64);
+        GetClassName(hwnd, cls, cls.Capacity);
+        string name = cls.ToString();
+        if (name == "Rustart.Overlay") {
+            // Match the rounded region diameter in src/overlay/view.rs.
+            double diameter = (44 * dpi + 48) / 96;
+            return hasRegion ? Math.Min(diameter, Math.Min(width, height)) / 2 : 0;
+        }
+        if (name != "Rustart.TrayMenu")
+            throw new InvalidOperationException("Unsupported Rustart screenshot window.");
+        var contrast = new HighContrast { Size = (uint)Marshal.SizeOf(typeof(HighContrast)) };
+        if (!SystemParametersInfoW(0x0042, contrast.Size, ref contrast, 0))
+            throw new InvalidOperationException("Could not determine the tray menu corner style.");
+        // The tray requests the standard Windows 11 DWM corner except in high contrast.
+        return Environment.OSVersion.Version.Build >= 22000 && (contrast.Flags & 1) == 0
+            ? Math.Min(8 * dpi / 96.0, Math.Min(width, height) / 2.0) : 0;
+    }
+
+    private static void ApplyWindowAlpha(int[] pixels, int width, int height, double radius, IntPtr region, int unpainted) {
+        const int samples = 8, rgbMask = 0x00ffffff;
+        for (int y = 0; y < height; y++) {
+            for (int x = 0; x < width; x++) {
+                int index = y * width + x;
+                int edgeX = Math.Min(x, width - 1 - x), edgeY = Math.Min(y, height - 1 - y);
+                int covered = samples * samples;
+                bool corner = edgeX < radius && edgeY < radius;
+                if (corner) {
+                    covered = 0;
+                    for (int sy = 0; sy < samples; sy++) {
+                        double dy = Math.Max(0, radius - edgeY - (sy + 0.5) / samples);
+                        for (int sx = 0; sx < samples; sx++) {
+                            double dx = Math.Max(0, radius - edgeX - (sx + 0.5) / samples);
+                            if (dx * dx + dy * dy <= radius * radius) covered++;
+                        }
+                    }
+                }
+                if (covered == 0) {
+                    pixels[index] = 0;
+                    continue;
+                }
+                int color = pixels[index];
+                if (corner && region != IntPtr.Zero && !PtInRegion(region, x, y)) {
+                    // PrintWindow fills the area outside the hard region with black.
+                    // Extend the edge color into the additional antialias coverage.
+                    int stepX = edgeX <= edgeY ? (x < width / 2 ? 1 : -1) : 0;
+                    int stepY = edgeX > edgeY ? (y < height / 2 ? 1 : -1) : 0;
+                    int sourceX = x + stepX, sourceY = y + stepY;
+                    while (sourceX >= 0 && sourceX < width && sourceY >= 0 && sourceY < height &&
+                           !PtInRegion(region, sourceX, sourceY)) {
+                        sourceX += stepX;
+                        sourceY += stepY;
+                    }
+                    if (sourceX < 0 || sourceX >= width || sourceY < 0 || sourceY >= height)
+                        throw new InvalidOperationException("Could not sample the Rustart window edge.");
+                    color = pixels[sourceY * width + sourceX];
+                }
+                if (color == unpainted)
+                    throw new InvalidOperationException("Rustart left part of the capture unpainted.");
+                int alpha = (covered * 255 + samples * samples / 2) / (samples * samples);
+                pixels[index] = (color & rgbMask) | (alpha << 24);
+            }
+        }
+    }
     [DllImport("user32")] private static extern IntPtr MonitorFromWindow(IntPtr hwnd, uint flags);
     [DllImport("user32", EntryPoint = "GetMonitorInfoW")] private static extern bool GetMonitorInfo(IntPtr monitor, ref MonitorInfo info);
     [StructLayout(LayoutKind.Sequential)] public struct Point { public int X, Y; }
