@@ -189,9 +189,7 @@ impl Buttons {
     pub(super) fn leave(&self, hwnd: HWND) {
         if self.hot.get() == hwnd {
             self.hot.set(null_mut());
-            unsafe {
-                InvalidateRect(hwnd, null_mut(), 0);
-            }
+            invalidate_action(hwnd);
         }
     }
 }

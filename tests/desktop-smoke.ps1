@@ -122,6 +122,48 @@ function Click-RowAction([int]$id) {
     $null = $probe::Post($button, 0x00f5, [IntPtr]0, [IntPtr]0)
 }
 
+function Check-RowActionHover($buttonBounds, $listBounds) {
+    if ($probe::SelectedActionHoverColorsMatch()) {
+        Write-Warning 'The selected action and its hover outline use the same high contrast color.'
+        return
+    }
+    Require ($probe::GetForegroundWindow() -eq $overlay) 'Rustart lost focus before the hover check.'
+    $savedPoint = New-Object DesktopProbe+Point
+    Require ($probe::GetCursorPos([ref]$savedPoint)) 'Could not read the pointer before the hover check.'
+    $buttonX = [int](($buttonBounds.Left + $buttonBounds.Right) / 2)
+    $buttonY = [int](($buttonBounds.Top + $buttonBounds.Bottom) / 2)
+    $textX = [int](($listBounds.Left + $buttonBounds.Left) / 2)
+    $sampleHeight = [int](($buttonBounds.Bottom - $buttonBounds.Top) / 4)
+
+    # Read the painted display. The top stripe sees both the normal hover fill
+    # and the high contrast outline without touching the icon.
+    Add-Type -AssemblyName System.Drawing
+    $sample = [Drawing.Bitmap]::new(1, $sampleHeight)
+    $graphics = [Drawing.Graphics]::FromImage($sample)
+    $readStripe = {
+        $graphics.CopyFromScreen($buttonX, $buttonBounds.Top, 0, 0, $sample.Size)
+        $colors = foreach ($y in 0..($sampleHeight - 1)) { $sample.GetPixel(0, $y).ToArgb() }
+        $colors -join ','
+    }
+    try {
+        Require ($probe::SetCursorPos($textX, $buttonY)) 'Could not move the pointer to the row text.'
+        Start-Sleep -Milliseconds 130
+        $normal = & $readStripe
+        Require ($probe::SetCursorPos($buttonX, $buttonY)) 'Could not move the pointer to the row action.'
+        Await { (& $readStripe) -ne $normal } 'Moving onto the row action did not paint its hover state.'
+        Require ($probe::SetCursorPos($textX, $buttonY)) 'Could not move the pointer off the row action.'
+        Await { (& $readStripe) -eq $normal } 'The row action stayed highlighted after the pointer left.'
+    } finally {
+        $graphics.Dispose()
+        $sample.Dispose()
+        $currentPoint = New-Object DesktopProbe+Point
+        if ($probe::GetCursorPos([ref]$currentPoint) -and $currentPoint.Y -eq $buttonY -and
+            $currentPoint.X -in @($textX, $buttonX)) {
+            $null = $probe::SetCursorPos($savedPoint.X, $savedPoint.Y)
+        }
+    }
+}
+
 function Has-ProbeLogo([int]$row) {
     # The fixture's embedded Rustart icon has a cyan terminal prompt. Capture just
     # the icon column, in device pixels, to distinguish it from the neutral fallback.
@@ -330,6 +372,7 @@ try {
     Require ($openRect.Left -gt ($listRect.Left + $listRect.Right) / 2 -and
         $openRect.Right -lt $folderRect.Left -and $folderRect.Right -le $listRect.Right -and
         ($listRect.Right - $folderRect.Right) -lt ($folderRect.Right - $folderRect.Left)) 'Row actions do not occupy the right edge.'
+    Check-RowActionHover $openRect $listRect
     $probe::Query($edit, $aliasName)
     Require ($probe::Value($list, 0x018b) -eq 1 -and $probe::Row($list, 0) -eq $aliasName) 'Alternate name did not resolve to one program.'
     Press @(0x0d)

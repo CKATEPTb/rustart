@@ -24,6 +24,7 @@ public static class DesktopProbe
     [DllImport("dwmapi")] private static extern int DwmGetWindowAttribute(IntPtr hwnd, int attribute, out int value, int size);
     [DllImport("user32", CharSet = CharSet.Unicode)] private static extern int GetClassName(IntPtr hwnd, StringBuilder name, int capacity);
     [DllImport("user32")] private static extern bool SystemParametersInfoW(uint action, uint size, ref HighContrast value, uint flags);
+    [DllImport("user32")] private static extern uint GetSysColor(int index);
     [DllImport("gdi32")] private static extern IntPtr CreateRectRgn(int left, int top, int right, int bottom);
     [DllImport("gdi32")] private static extern bool PtInRegion(IntPtr region, int x, int y);
     [DllImport("gdi32")] private static extern IntPtr CreateCompatibleDC(IntPtr dc);
@@ -48,6 +49,13 @@ public static class DesktopProbe
     private struct HighContrast {
         public uint Size, Flags;
         public IntPtr Scheme;
+    }
+
+    public static bool SelectedActionHoverColorsMatch() {
+        var contrast = new HighContrast { Size = (uint)Marshal.SizeOf(typeof(HighContrast)) };
+        const int highlight = 13, highlightText = 14;
+        return SystemParametersInfoW(0x0042, contrast.Size, ref contrast, 0) &&
+            (contrast.Flags & 1) != 0 && GetSysColor(highlight) == GetSysColor(highlightText);
     }
 
     public sealed class WindowImage {
