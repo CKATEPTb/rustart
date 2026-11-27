@@ -11,10 +11,7 @@ use std::{
     env,
     fs::{File, OpenOptions},
     io::{self, Cursor},
-    os::windows::{
-        fs::{MetadataExt, OpenOptionsExt},
-        process::CommandExt,
-    },
+    os::windows::fs::{MetadataExt, OpenOptionsExt},
     path::Path,
     process::{Child, Command},
     ptr::null_mut,
@@ -26,10 +23,7 @@ use windows_sys::Win32::{
     Storage::FileSystem::{
         FILE_ATTRIBUTE_REPARSE_POINT, FILE_FLAG_OPEN_REPARSE_POINT, FILE_SHARE_READ,
     },
-    System::{
-        LibraryLoader::{LOAD_LIBRARY_SEARCH_SYSTEM32, SetDefaultDllDirectories},
-        Threading::CREATE_NO_WINDOW,
-    },
+    System::LibraryLoader::{LOAD_LIBRARY_SEARCH_SYSTEM32, SetDefaultDllDirectories},
     UI::WindowsAndMessaging::{MB_ICONERROR, MB_OK, MessageBoxW},
 };
 use windows_sys::core::w;
@@ -71,7 +65,7 @@ fn spawn(path: &Path, from_terminal: bool, origin: &Path) -> io::Result<Child> {
         .args(env::args_os().skip(1))
         .env(launch_context::PACKAGE_ORIGIN, origin);
     if !from_terminal {
-        child.creation_flags(CREATE_NO_WINDOW);
+        launch_context::configure_graphical_child(&mut child);
     }
     child.spawn()
 }

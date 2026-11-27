@@ -5,15 +5,12 @@ mod fixture;
 
 use crate::{
     i18n::{self, Msg, render, tr},
-    launch_context::PACKAGE_ORIGIN,
+    launch_context::{self, PACKAGE_ORIGIN},
     runtime,
 };
 use std::{
     env, io,
-    os::windows::{
-        io::{AsRawHandle, FromRawHandle, OwnedHandle},
-        process::CommandExt,
-    },
+    os::windows::io::{AsRawHandle, FromRawHandle, OwnedHandle},
     path::{Path, PathBuf},
     process::Command,
     ptr::null,
@@ -22,8 +19,8 @@ use windows_sys::{
     Win32::{
         Foundation::{WAIT_ABANDONED, WAIT_OBJECT_0, WAIT_TIMEOUT},
         System::Threading::{
-            CREATE_NO_WINDOW, CreateMutexExW, MUTEX_MODIFY_STATE, ReleaseMutex,
-            SYNCHRONIZATION_SYNCHRONIZE, WaitForSingleObject,
+            CreateMutexExW, MUTEX_MODIFY_STATE, ReleaseMutex, SYNCHRONIZATION_SYNCHRONIZE,
+            WaitForSingleObject,
         },
     },
     core::w,
@@ -128,7 +125,7 @@ fn launch(destination: &Path, args: &[String], silent: bool) -> Result<bool, Str
     let mut command = Command::new(destination);
     command.args(args).env_remove(PACKAGE_ORIGIN);
     if silent {
-        command.creation_flags(CREATE_NO_WINDOW);
+        launch_context::configure_graphical_child(&mut command);
     }
     command
         .status()
