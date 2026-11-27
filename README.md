@@ -6,7 +6,7 @@ Rustart is a simple, lightweight app launcher for Windows, written in Rust. Pres
 
 ## Install on Windows
 
-1. Download `rustart.exe` for Windows x64 from [GitHub Releases](https://github.com/CKATEPTb/rustart/releases), or [build it from source](#build-from-source) if the release list is empty.
+1. Download `rustart.exe` for Windows x64 from [GitHub Releases](https://github.com/CKATEPTb/rustart/releases).
 2. Run the file and approve the Windows prompt. Rustart installs to `%ProgramFiles%\CKATEPTb\Rustart` and adds an icon to the system tray. To update, run the new executable.
 
 ## Keyboard shortcuts
@@ -23,7 +23,9 @@ The folder button beside an app opens its location in File Explorer. In PowerShe
 
 ![Rustart calculating (128 × 3) + (42 ÷ 2) and showing 405](assets/readme/calculator.png)
 
-Right-click the tray icon to change the shortcut, start Rustart at sign-in, or choose from 12 interface languages. [View the tray menu](assets/readme/tray.png).
+Right-click the tray icon to change the shortcut, start Rustart at sign-in, or choose from 12 interface languages.
+
+![Rustart tray menu with keyboard shortcut, language, and startup settings](assets/readme/tray.png)
 
 ## Build from source
 
@@ -32,5 +34,3 @@ On Windows x64, install Rust with the MSVC toolchain, Visual Studio C++ Build To
 ```powershell
 .\scripts\package-release.ps1
 ```
-
-To change the version, edit [VERSION](VERSION) and run `.\scripts\sync-version.ps1` in PowerShell 7. GitHub Actions checks pushes and pull requests on `development` and `production`. When a push to `production` passes, the [release workflow](.github/workflows/windows.yml) publishes the LZX-compressed executable to GitHub Releases.
