@@ -1,6 +1,6 @@
 [package]
 name = "rustart"
-version = "0.4.4" # Generated from VERSION.
+version = "0.4.5" # Generated from VERSION.
 edition = "2024"
 description = "A native Windows application launcher and calculator"
 license = "MIT"
