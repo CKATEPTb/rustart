@@ -1,5 +1,7 @@
 mod calc;
 #[cfg(windows)]
+mod catalog;
+#[cfg(windows)]
 mod i18n;
 #[cfg(windows)]
 mod prefs;
@@ -22,6 +24,21 @@ fn run(args: &[String]) -> Result<(), String> {
             }
             let result = calc::evaluate(&input).ok_or_else(|| tr(Msg::CliExpectedExpression))??;
             println!("{result}");
+        }
+        Some((verb, [])) if verb == "--catalog-worker" => catalog::write_discovery()?,
+        Some((verb, [channel])) if verb == "--launch-normal-worker" => {
+            catalog::standard_launch_worker(channel)?;
+        }
+        Some((verb, rest)) if verb == "search" => {
+            let input = rest.join(" ");
+            if input.trim().is_empty() {
+                return Err(tr(Msg::CliMissingInput).into());
+            }
+            let apps = catalog::discover()?;
+            for index in catalog::search(&apps, &input) {
+                let app = &apps[index];
+                println!("{}\t{}", app.name, app.detail);
+            }
         }
         Some((verb, _)) => return Err(render(Msg::CliUnknownCommand, &[("command", verb)])),
         None => return Err(tr(Msg::CliMissingInput).into()),
