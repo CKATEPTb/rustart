@@ -15,6 +15,7 @@ public static class DesktopProbe
     [DllImport("user32", CharSet = CharSet.Unicode)] public static extern IntPtr FindWindow(string cls, string title);
     [DllImport("user32")] public static extern IntPtr GetDlgItem(IntPtr hwnd, int id);
     [DllImport("user32")] public static extern bool IsWindowVisible(IntPtr hwnd);
+    [DllImport("user32")] public static extern bool IsWindow(IntPtr hwnd);
     [DllImport("user32")] public static extern IntPtr GetForegroundWindow();
     [DllImport("user32")] public static extern bool GetWindowRect(IntPtr hwnd, out Rect rect);
     [DllImport("user32")] public static extern bool GetClientRect(IntPtr hwnd, out Rect rect);

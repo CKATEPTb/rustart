@@ -188,32 +188,98 @@ function Has-ProbeLogo([int]$row) {
     } finally { $bitmap.Dispose() }
 }
 
-function Check-Folder([string]$folder, [string]$selectedFile, [string]$appId) {
-    $explorer = New-Object -ComObject Shell.Application
-    $windowsBefore = @($explorer.Windows() | ForEach-Object { $_.HWND })
-    Click-RowAction 112
-    Await {
-        foreach ($window in $explorer.Windows()) {
-            try {
-                $view = $window.Document
-                $path = $view.Folder.Self.Path
-                $selected = $view.SelectedItems()
-                $inFolder = $path -eq $folder -and (!$selectedFile -or
-                    ($selected.Count -eq 1 -and $selected.Item(0).Path -eq $selectedFile))
-                $inAppsFolder = $appId -and $path -match '4234d49b-0245-4df3-b780-3893943456e1' -and
-                    $selected.Count -eq 1 -and ($selected.Item(0).ExtendedProperty('System.AppUserModel.ID') -eq $appId)
-            } catch { continue } # Explorer tabs can close during enumeration.
-            if ($inFolder -or $inAppsFolder) {
-                $script:fixtureExplorer = $window
-                return $true
+function Find-RevealedFolder($explorer, [string]$folder, [string]$selectedFile, [string]$appId,
+    [IntPtr]$expectedWindow = [IntPtr]::Zero, [switch]$IncludeHidden) {
+    foreach ($window in $explorer.Windows()) {
+        try {
+            $hwnd = [IntPtr]$window.HWND
+            if ((!$IncludeHidden -and !$probe::Visible($hwnd)) -or
+                ($expectedWindow -ne 0 -and $hwnd -ne $expectedWindow)) {
+                continue
             }
+            $view = $window.Document
+            $path = $view.Folder.Self.Path
+            $selected = $view.SelectedItems()
+            $inFolder = $path -eq $folder -and (!$selectedFile -or
+                ($selected.Count -eq 1 -and $selected.Item(0).Path -eq $selectedFile))
+            $inAppsFolder = $appId -and $path -match '4234d49b-0245-4df3-b780-3893943456e1' -and
+                $selected.Count -eq 1 -and ($selected.Item(0).ExtendedProperty('System.AppUserModel.ID') -eq $appId)
+            if ($inFolder -or $inAppsFolder) {
+                return @{ Window = $window; Handle = $hwnd }
+            }
+        } catch { continue } # Explorer tabs can close during enumeration.
+    }
+}
+
+function Check-Folder([string]$folder, [string]$selectedFile, [string]$appId,
+    [scriptblock]$reveal = { Click-RowAction 112 }) {
+    $explorer = New-Object -ComObject Shell.Application
+    $windowsBefore = @($explorer.Windows() | ForEach-Object { [IntPtr]$_.HWND })
+    $result = @{ Match = $null }
+    try {
+        & $reveal
+        Await {
+            $result.Match = Find-RevealedFolder $explorer $folder $selectedFile $appId
+            $null -ne $result.Match
+        } 'Explorer did not show the expected application location in a visible window.'
+        Await { !$probe::Visible($overlay) } 'The launcher stayed open after revealing the application.'
+        Await-SingleRustartProcess 'show in folder'
+
+        # Leave the revealed view alone long enough to catch a window that closes
+        # or loses its selection as the launcher and shell worker finish.
+        $settled = [Diagnostics.Stopwatch]::StartNew()
+        do {
+            $match = Find-RevealedFolder $explorer $folder $selectedFile $appId $result.Match.Handle
+            Require ($null -ne $match) 'Explorer lost the revealed location or selection after the shell worker finished.'
+            Start-Sleep -Milliseconds 100
+        } while ($settled.ElapsedMilliseconds -lt 1000)
+    } finally {
+        if (!$result.Match) {
+            $result.Match = Find-RevealedFolder $explorer $folder $selectedFile $appId -IncludeHidden
         }
-        return $false
-    } 'Explorer did not show the expected application location.'
-    $explorerWindow = [IntPtr]$fixtureExplorer.HWND
-    if ($fixtureExplorer.HWND -notin $windowsBefore) {
-        $fixtureExplorer.Quit()
-        Await { !$probe::Visible($explorerWindow) } 'The fixture Explorer window did not close.'
+        if ($result.Match -and $result.Match.Handle -notin $windowsBefore -and
+            $probe::IsWindow($result.Match.Handle)) {
+            $result.Match.Window.Quit()
+            Await { !$probe::IsWindow($result.Match.Handle) } 'The fixture Explorer window did not close.'
+        }
+    }
+}
+
+function Invoke-HiddenRevealWorker([string]$target) {
+    $info = [Diagnostics.ProcessStartInfo]::new($Exe, '--shell-action-worker')
+    $info.UseShellExecute = $false
+    $info.CreateNoWindow = $true
+    $info.WindowStyle = [Diagnostics.ProcessWindowStyle]::Hidden
+    $info.RedirectStandardInput = $true
+    $info.RedirectStandardOutput = $true
+    $info.RedirectStandardError = $true
+
+    $request = @{ operation = 'Reveal'; name = [IO.Path]::GetFileName($target); source = @{ Desktop = $target } }
+    $body = [Text.Encoding]::UTF8.GetBytes(($request | ConvertTo-Json -Depth 4 -Compress))
+    $worker = [Diagnostics.Process]::Start($info)
+    $buffer = [IO.MemoryStream]::new()
+    $stdin = $worker.StandardInput.BaseStream
+    try {
+        $reply = $worker.StandardOutput.BaseStream.CopyToAsync($buffer)
+        $diagnostics = $worker.StandardError.ReadToEndAsync()
+        # Write directly to the byte stream. The worker reads one versioned frame.
+        $stdin.WriteByte(1)
+        $stdin.Write([BitConverter]::GetBytes([int]$body.Length), 0, 4)
+        $stdin.Write($body, 0, $body.Length)
+        $stdin.Flush()
+        Require ($worker.WaitForExit(10000)) 'The hidden reveal worker did not exit.'
+        Require ($reply.Wait(2000) -and $diagnostics.Wait(2000)) 'The hidden reveal worker did not close its output.'
+        Require ($worker.ExitCode -eq 0) "The hidden reveal worker exited with code $($worker.ExitCode). $($diagnostics.Result)"
+        $packet = $buffer.ToArray()
+        Require ($packet.Length -gt 5 -and $packet[0] -eq 1 -and
+            [BitConverter]::ToInt32($packet, 1) -eq ($packet.Length - 5)) 'The hidden reveal worker returned an invalid frame.'
+        $response = [Text.Encoding]::UTF8.GetString($packet, 5, $packet.Length - 5)
+        Require ($response -ceq '{"Ok":null}') "The hidden reveal worker returned $response"
+    } finally {
+        if (!$worker.HasExited) { $worker.Kill() }
+        $stdin.Dispose()
+        $worker.Dispose()
+        $buffer.Dispose()
     }
 }
 
@@ -394,6 +460,12 @@ try {
     Await { $probe::Row($list, 0) -eq "$tag 00" } 'Live index did not pick up rename.'
     if ($CheckReveal) {
         Check-Folder $targetDir $target
+        # Use a fresh location so Explorer must create or navigate a view under hidden startup.
+        $hiddenDir = Join-Path $scratch 'Hidden reveal'
+        $null = New-Item -ItemType Directory -Path $hiddenDir
+        $hiddenTarget = Join-Path $hiddenDir ([IO.Path]::GetFileName($target))
+        Copy-Item -LiteralPath $target -Destination $hiddenTarget
+        Check-Folder $hiddenDir $hiddenTarget -Reveal { Invoke-HiddenRevealWorker $hiddenTarget }
         Open-Overlay
         $probe::Query($edit, $tag)
     }
