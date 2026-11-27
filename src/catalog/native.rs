@@ -266,6 +266,8 @@ pub fn launch(source: &Source, name: &str, elevated: bool) -> Result<(), String>
 }
 
 fn elevate_desktop(path: &Path) -> io::Result<()> {
+    let panel = shortcut::control_panel_shortcut(path);
+    let path = panel.as_deref().unwrap_or(path);
     let file: Vec<_> = path.as_os_str().encode_wide().chain([0]).collect();
     let mut operation = SHELLEXECUTEINFOW {
         cbSize: size_of::<SHELLEXECUTEINFOW>() as u32,

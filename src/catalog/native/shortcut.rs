@@ -21,12 +21,13 @@ use windows::{
             STGM_SHARE_DENY_NONE,
         },
         UI::Shell::{
-            Common::ITEMIDLIST, FOLDERID_AppsFolder, ILGetSize, IShellLinkDataList, IShellLinkW,
-            SHGetKnownFolderIDList, SHGetNameFromIDList, SIGDN_PARENTRELATIVEPARSING,
-            SLDF_RUNAS_USER, SLGP_RAWPATH, ShellLink,
+            Common::ITEMIDLIST, FOLDERID_AppsFolder, FOLDERID_System, ILGetSize,
+            IShellLinkDataList, IShellLinkW, KF_FLAG_DEFAULT, SHGetKnownFolderIDList,
+            SHGetKnownFolderPath, SHGetNameFromIDList, SHParseDisplayName,
+            SIGDN_PARENTRELATIVEPARSING, SLDF_RUNAS_USER, SLGP_RAWPATH, ShellLink,
         },
     },
-    core::{Interface, PCWSTR},
+    core::{Interface, PCWSTR, w},
 };
 use windows_sys::Win32::{
     Storage::FileSystem::{
@@ -175,6 +176,37 @@ pub(super) fn target(source: &Path) -> Option<PathBuf> {
     read_target(&open(source)?)
 }
 
+// The Start menu's Control Panel link points to a virtual root rather than a
+// file. Compare its entire saved PIDL with the one Windows gives that root.
+fn control_panel_executable(link: &IShellLinkW) -> Option<PathBuf> {
+    let target = Pidl(NonNull::new(unsafe { link.GetIDList().ok()? })?);
+    let mut panel = null_mut();
+    unsafe {
+        SHParseDisplayName(
+            w!("::{5399E694-6CE5-4D6C-8FCE-1D8870FDCBA0}"),
+            None,
+            &mut panel,
+            0,
+            None,
+        )
+        .ok()?;
+    }
+    let panel = Pidl(NonNull::new(panel)?);
+    if target.bytes() != panel.bytes() {
+        return None;
+    }
+    let system = unsafe { SHGetKnownFolderPath(&FOLDERID_System, KF_FLAG_DEFAULT, None).ok()? };
+    Some(PathBuf::from(owned_string(system)).join("control.exe"))
+}
+
+pub(super) fn control_panel_shortcut(source: &Path) -> Option<PathBuf> {
+    let link = open(source)?;
+    if read_target(&link).is_some() {
+        return None;
+    }
+    control_panel_executable(&link)
+}
+
 pub(super) enum LaunchTarget {
     Desktop {
         path: PathBuf,
@@ -193,6 +225,14 @@ pub(super) fn for_standard_launch(source: &Path) -> Option<LaunchTarget> {
         return Some(LaunchTarget::RequiresElevation);
     }
     let Some(path) = read_target(&link) else {
+        if let Some(path) = control_panel_executable(&link) {
+            return Some(LaunchTarget::Desktop {
+                path,
+                arguments: OsString::new(),
+                directory: None,
+                show: None,
+            });
+        }
         return Index::new().virtual_app(&link).map(LaunchTarget::Package);
     };
     if let Some(id) = path.to_str().and_then(apps_folder_id) {
@@ -408,6 +448,71 @@ fn collapse_parents(path: &Path) -> Option<PathBuf> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn resolves_only_the_control_panel_namespace_link_as_a_standard_process() {
+        use windows::{Win32::UI::Shell::SHParseDisplayName, core::w};
+        use windows_sys::Win32::System::SystemInformation::GetSystemDirectoryW;
+
+        let _apartment = super::super::Apartment::enter().unwrap();
+        let fixture =
+            std::env::temp_dir().join(format!("rustart-control-panel-{}.lnk", std::process::id()));
+        struct Cleanup<'a>(&'a Path);
+        impl Drop for Cleanup<'_> {
+            fn drop(&mut self) {
+                let _ = fs::remove_file(self.0);
+            }
+        }
+        fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&fixture)
+            .unwrap();
+        let _cleanup = Cleanup(&fixture);
+        let fixture_wide: Vec<_> = fixture.as_os_str().encode_wide().chain([0]).collect();
+        let save_link = |target, run_as| unsafe {
+            let mut id = null_mut();
+            SHParseDisplayName(target, None, &mut id, 0, None).unwrap();
+            let id = Pidl(NonNull::new(id).unwrap());
+            let link: IShellLinkW =
+                CoCreateInstance(&ShellLink, None, CLSCTX_INPROC_SERVER).unwrap();
+            link.SetIDList(id.0.as_ptr()).unwrap();
+            link.SetArguments(w!("dummy-argument")).unwrap();
+            if run_as {
+                let data: IShellLinkDataList = link.cast().unwrap();
+                data.SetFlags(data.GetFlags().unwrap() | SLDF_RUNAS_USER.0 as u32)
+                    .unwrap();
+            }
+            let file: IPersistFile = link.cast().unwrap();
+            file.Save(PCWSTR(fixture_wide.as_ptr()), true).unwrap();
+        };
+
+        let control_panel = w!("::{5399E694-6CE5-4D6C-8FCE-1D8870FDCBA0}");
+        save_link(control_panel, false);
+        let Some(LaunchTarget::Desktop {
+            path, arguments, ..
+        }) = for_standard_launch(&fixture)
+        else {
+            panic!("the Control Panel shortcut did not resolve to a process");
+        };
+        let mut system = [0; 32768];
+        let length = unsafe { GetSystemDirectoryW(system.as_mut_ptr(), system.len() as u32) };
+        assert!(length > 0 && (length as usize) < system.len());
+        let system = PathBuf::from(OsString::from_wide(&system[..length as usize]));
+        assert_eq!(path, system.join("control.exe"));
+        assert!(arguments.is_empty());
+        assert_eq!(control_panel_shortcut(&fixture), Some(path));
+
+        save_link(w!("::{645FF040-5081-101B-9F08-00AA002F954E}"), false);
+        assert!(for_standard_launch(&fixture).is_none());
+        assert!(control_panel_shortcut(&fixture).is_none());
+
+        save_link(control_panel, true);
+        assert!(matches!(
+            for_standard_launch(&fixture),
+            Some(LaunchTarget::RequiresElevation)
+        ));
+    }
 
     fn local_file_id(path: &Path) -> Option<Identity> {
         file_id(&resolve_local_file(path)?)
