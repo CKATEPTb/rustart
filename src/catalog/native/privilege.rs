@@ -82,6 +82,10 @@ impl Process {
         Ok(session)
     }
 
+    pub(super) fn allow_foreground(&self) {
+        unsafe { windows_sys::Win32::UI::WindowsAndMessaging::AllowSetForegroundWindow(self.pid) };
+    }
+
     pub(super) fn image(&self) -> io::Result<PathBuf> {
         let mut value = vec![0; 32768];
         let mut size = value.len() as u32;

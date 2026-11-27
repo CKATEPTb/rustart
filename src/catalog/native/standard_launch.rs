@@ -64,6 +64,9 @@ fn standard_action(source: &Source, operation: Operation) -> Result<(), String> 
             "the launch worker does not have the verified standard token",
         ));
     }
+    if matches!(operation, Operation::Reveal) {
+        worker.allow_foreground();
+    }
     channel
         .send(&Request {
             operation,

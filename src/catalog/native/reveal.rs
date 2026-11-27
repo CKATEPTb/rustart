@@ -1,5 +1,5 @@
 use std::{
-    ffi::OsString,
+    ffi::{OsStr, OsString},
     fs,
     os::windows::ffi::{OsStrExt, OsStringExt},
     path::{Component, Path, PathBuf, Prefix},
@@ -8,23 +8,13 @@ use std::{
 use windows::{
     ApplicationModel::AppInfo,
     Win32::{
-        System::{
-            Com::CoTaskMemFree,
-            WinRT::{RO_INIT_SINGLETHREADED, RoInitialize, RoUninitialize},
-        },
-        UI::Shell::{
-            IShellItem, SHCreateItemFromParsingName, SHGetIDListFromObject,
-            SHOpenFolderAndSelectItems,
-        },
+        System::WinRT::{RO_INIT_SINGLETHREADED, RoInitialize, RoUninitialize},
+        UI::Shell::{IShellItem, SHCreateItemFromParsingName},
     },
     core::{HSTRING, PCWSTR},
 };
 
-use super::{
-    Apartment,
-    explorer::{self, StandardDesktop},
-    packaged_item,
-};
+use super::{Apartment, explorer::StandardDesktop, packaged_item};
 use crate::{
     catalog::Source,
     i18n::{Msg, render},
@@ -53,7 +43,7 @@ pub(super) fn reveal_standard(
 
 fn reveal_desktop(source: &Path, desktop: &StandardDesktop) -> windows::core::Result<()> {
     if source.is_dir() {
-        return explorer::explore(desktop, source);
+        return desktop.explore(source);
     }
     if source
         .extension()
@@ -63,9 +53,9 @@ fn reveal_desktop(source: &Path, desktop: &StandardDesktop) -> windows::core::Re
         && let Ok(metadata) = fs::metadata(&target)
     {
         let result = if metadata.is_dir() {
-            Some(explorer::explore(desktop, &target))
+            Some(desktop.explore(&target))
         } else if metadata.is_file() {
-            Some(select_file(&target))
+            Some(select_file(desktop, &target))
         } else {
             None
         };
@@ -73,7 +63,7 @@ fn reveal_desktop(source: &Path, desktop: &StandardDesktop) -> windows::core::Re
             return Ok(());
         }
     }
-    select_file(source)
+    select_file(desktop, source)
 }
 fn filesystem_path(path: &Path) -> bool {
     if !path.is_absolute() {
@@ -94,30 +84,22 @@ fn filesystem_path(path: &Path) -> bool {
         _ => false,
     }
 }
-fn select_file(path: &Path) -> windows::core::Result<()> {
-    let path: Vec<_> = path.as_os_str().encode_wide().chain([0]).collect();
-    let item = unsafe { SHCreateItemFromParsingName(PCWSTR(path.as_ptr()), None)? };
-    select_item(&item)
-}
-
-fn select_item(item: &IShellItem) -> windows::core::Result<()> {
-    unsafe {
-        let id = SHGetIDListFromObject(item)?;
-        let result = SHOpenFolderAndSelectItems(id, None, 0);
-        CoTaskMemFree(Some(id.cast()));
-        result
-    }
+fn select_file(desktop: &StandardDesktop, path: &Path) -> windows::core::Result<()> {
+    let wide: Vec<_> = path.as_os_str().encode_wide().chain([0]).collect();
+    let _: IShellItem = unsafe { SHCreateItemFromParsingName(PCWSTR(wide.as_ptr()), None)? };
+    desktop.select(path.as_os_str())
 }
 
 fn reveal_packaged(id: &str, desktop: &StandardDesktop) -> windows::core::Result<()> {
     if let Some(folder) = installed_folder(id)
-        && explorer::explore(desktop, &folder).is_ok()
+        && desktop.explore(&folder).is_ok()
     {
         return Ok(());
     }
     // WindowsApps can deny directory enumeration to Explorer. In that case
     // select this application's exact shell item in the AppsFolder.
-    select_item(&packaged_item(id)?)
+    packaged_item(id)?;
+    desktop.select(OsStr::new(&format!(r"shell:AppsFolder\{id}")))
 }
 
 fn installed_folder(id: &str) -> Option<PathBuf> {
