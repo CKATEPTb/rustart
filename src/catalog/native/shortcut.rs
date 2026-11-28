@@ -24,7 +24,8 @@ use windows::{
             Common::ITEMIDLIST, FOLDERID_AppsFolder, FOLDERID_System, ILGetSize,
             IShellLinkDataList, IShellLinkW, KF_FLAG_DEFAULT, SHGetKnownFolderIDList,
             SHGetKnownFolderPath, SHGetNameFromIDList, SHParseDisplayName,
-            SIGDN_PARENTRELATIVEPARSING, SLDF_RUNAS_USER, SLGP_RAWPATH, ShellLink,
+            SIGDN_PARENTRELATIVEPARSING, SLDF_HAS_DARWINID, SLDF_RUNAS_USER, SLGP_RAWPATH,
+            ShellLink,
         },
     },
     core::{Interface, PCWSTR, w},
@@ -34,7 +35,12 @@ use windows_sys::Win32::{
         FILE_ATTRIBUTE_REPARSE_POINT, FILE_FLAG_OPEN_REPARSE_POINT, FILE_ID_INFO, FileIdInfo,
         GetDriveTypeW, GetFileInformationByHandleEx,
     },
-    System::Environment::ExpandEnvironmentStringsW,
+    System::{
+        ApplicationInstallationAndServicing::{
+            INSTALLSTATE_LOCAL, MsiGetComponentPathW, MsiGetShortcutTargetW,
+        },
+        Environment::ExpandEnvironmentStringsW,
+    },
 };
 
 use crate::catalog::identity::{Identity, apps_folder_id, executable_path, packaged_id};
@@ -92,7 +98,7 @@ impl Index {
         }
 
         let link = open(source)?;
-        let target = read_target(&link);
+        let target = read_target(source, &link);
         let virtual_id = target
             .as_deref()
             .and_then(|path| apps_folder_id(path.to_str()?));
@@ -173,7 +179,7 @@ impl Index {
 }
 
 pub(super) fn target(source: &Path) -> Option<PathBuf> {
-    read_target(&open(source)?)
+    read_target(source, &open(source)?)
 }
 
 // The Start menu's Control Panel link points to a virtual root rather than a
@@ -201,7 +207,7 @@ fn control_panel_executable(link: &IShellLinkW) -> Option<PathBuf> {
 
 pub(super) fn control_panel_shortcut(source: &Path) -> Option<PathBuf> {
     let link = open(source)?;
-    if read_target(&link).is_some() {
+    if read_target(source, &link).is_some() {
         return None;
     }
     control_panel_executable(&link)
@@ -224,7 +230,7 @@ pub(super) fn for_standard_launch(source: &Path) -> Option<LaunchTarget> {
     if unsafe { data.GetFlags().ok()? } & SLDF_RUNAS_USER.0 as u32 != 0 {
         return Some(LaunchTarget::RequiresElevation);
     }
-    let Some(path) = read_target(&link) else {
+    let Some(path) = read_target(source, &link) else {
         if let Some(path) = control_panel_executable(&link) {
             return Some(LaunchTarget::Desktop {
                 path,
@@ -293,7 +299,16 @@ fn explorer_app(link: &IShellLinkW) -> Option<String> {
     apps_folder_id(&String::from_utf16_lossy(nul_terminated(&buffer)?))
 }
 
-fn read_target(link: &IShellLinkW) -> Option<PathBuf> {
+fn read_target(source: &Path, link: &IShellLinkW) -> Option<PathBuf> {
+    let flags = link
+        .cast::<IShellLinkDataList>()
+        .ok()
+        .and_then(|data| unsafe { data.GetFlags().ok() });
+    if flags.is_some_and(|flags| flags & SLDF_HAS_DARWINID.0 as u32 != 0) {
+        // An advertised MSI link can store an icon as its raw path. Query the
+        // installed component without activating the link or repairing the MSI.
+        return installed_shortcut_target(source);
+    }
     // Read only the persisted target. Resolve could search drives, retry over
     // the network or ask the user to repair a shortcut.
     let mut buffer = vec![0; 32768];
@@ -302,6 +317,38 @@ fn read_target(link: &IShellLinkW) -> Option<PathBuf> {
             .ok()?
     };
     expand_path(&buffer)
+}
+
+fn installed_shortcut_target(source: &Path) -> Option<PathBuf> {
+    let source: Vec<_> = source.as_os_str().encode_wide().chain([0]).collect();
+    let mut product = [0; 39];
+    let mut component = [0; 39];
+    if unsafe {
+        MsiGetShortcutTargetW(
+            source.as_ptr(),
+            product.as_mut_ptr(),
+            null_mut(),
+            component.as_mut_ptr(),
+        )
+    } != 0
+    {
+        return None;
+    }
+    let mut path = vec![0; 32768];
+    let mut length = path.len() as u32;
+    let state = unsafe {
+        MsiGetComponentPathW(
+            product.as_ptr(),
+            component.as_ptr(),
+            path.as_mut_ptr(),
+            &mut length,
+        )
+    };
+    if state != INSTALLSTATE_LOCAL {
+        return None;
+    }
+    let path = PathBuf::from(OsString::from_wide(path.get(..length as usize)?));
+    path.is_absolute().then_some(path)
 }
 
 fn expand_path(buffer: &[u16]) -> Option<PathBuf> {
@@ -516,6 +563,25 @@ mod tests {
 
     fn local_file_id(path: &Path) -> Option<Identity> {
         file_id(&resolve_local_file(path)?)
+    }
+
+    #[test]
+    #[ignore = "requires RUSTART_TEST_MSI_SHORTCUT and RUSTART_TEST_MSI_EXE from an installed MSI"]
+    fn resolves_an_advertised_shortcut_for_search_launch_and_reveal() {
+        let _apartment = super::super::Apartment::enter().unwrap();
+        let link = PathBuf::from(std::env::var_os("RUSTART_TEST_MSI_SHORTCUT").unwrap());
+        let exe = PathBuf::from(std::env::var_os("RUSTART_TEST_MSI_EXE").unwrap());
+        let expected = local_file_id(&exe).unwrap();
+        let mut index = Index::new();
+        assert_eq!(index.identify(&link).unwrap().0, expected);
+        assert_eq!(
+            local_file_id(&target(&link).unwrap()),
+            Some(expected.clone())
+        );
+        let Some(LaunchTarget::Desktop { path, .. }) = for_standard_launch(&link) else {
+            panic!("the installed component did not resolve to a launchable application")
+        };
+        assert_eq!(local_file_id(&path), Some(expected));
     }
 
     #[test]

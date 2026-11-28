@@ -29,10 +29,10 @@ use windows::{
         },
         UI::Shell::{
             AO_NONE, ApplicationActivationManager, BHID_EnumItems, FOLDERID_AppsFolder,
-            FOLDERID_CommonPrograms, FOLDERID_Programs, IApplicationActivationManager,
-            IEnumShellItems, IShellItem, KF_FLAG_DEFAULT, SHCreateItemFromParsingName,
-            SHGetIDListFromObject, SHGetKnownFolderItem, SHGetKnownFolderPath, SIGDN,
-            SIGDN_NORMALDISPLAY, SIGDN_PARENTRELATIVEPARSING,
+            FOLDERID_CommonPrograms, FOLDERID_CommonStartup, FOLDERID_Programs, FOLDERID_Startup,
+            IApplicationActivationManager, IEnumShellItems, IShellItem, KF_FLAG_DEFAULT,
+            SHCreateItemFromParsingName, SHGetIDListFromObject, SHGetKnownFolderItem,
+            SHGetKnownFolderPath, SIGDN, SIGDN_NORMALDISPLAY, SIGDN_PARENTRELATIVEPARSING,
         },
     },
     core::{GUID, PCWSTR, PWSTR, w},
@@ -122,6 +122,14 @@ fn desktop_apps(
     let root = unsafe { SHGetKnownFolderPath(folder, KF_FLAG_DEFAULT, None) }
         .map_err(|error| error.to_string())?;
     let root = PathBuf::from(owned_string(root));
+    let startup_folder = if common {
+        &FOLDERID_CommonStartup
+    } else {
+        &FOLDERID_Startup
+    };
+    let startup = unsafe { SHGetKnownFolderPath(startup_folder, KF_FLAG_DEFAULT, None) }
+        .ok()
+        .map(|path| PathBuf::from(owned_string(path)));
     let entries = fs::read_dir(&root).map_err(|error| error.to_string())?;
     let mut directories = vec![entries];
 
@@ -164,8 +172,12 @@ fn desktop_apps(
                 .filter(|parent| !parent.as_os_str().is_empty())
                 .map(|parent| parent.to_string_lossy().into_owned());
             let identity = identities.identify(&path);
+            let in_startup = startup
+                .as_ref()
+                .is_some_and(|folder| path.starts_with(folder));
             let mut app = App::new(desktop_name(&path), detail, Source::Desktop(path));
             app.common_shortcut = common;
+            app.startup_shortcut = in_startup;
             if let Some((identity, path)) = identity {
                 if let Identity::Packaged(id) = &identity {
                     app.aumid = Some(id.clone());

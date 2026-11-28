@@ -18,6 +18,7 @@ fn main() {
                 "gdiplus.dll",
                 "dwmapi.dll",
                 "propsys.dll",
+                "msi.dll",
                 "xmllite.dll",
                 "wtsapi32.dll",
                 "bcrypt.dll",

@@ -28,6 +28,8 @@ pub struct App {
     aumid: Option<String>,
     executable_display: Option<String>,
     common_shortcut: bool,
+    #[serde(default)]
+    startup_shortcut: bool,
 }
 
 impl App {
@@ -58,6 +60,7 @@ impl App {
             aumid,
             executable_display: None,
             common_shortcut: false,
+            startup_shortcut: false,
         }
     }
 }
@@ -108,6 +111,7 @@ pub fn search(apps: &[App], query: &str) -> Vec<usize> {
             Some((
                 score,
                 name,
+                app.startup_shortcut,
                 app.common_shortcut,
                 &app.source_sort_key,
                 index,
@@ -119,7 +123,7 @@ pub fn search(apps: &[App], query: &str) -> Vec<usize> {
     let mut seen = HashSet::new();
     matches
         .into_iter()
-        .filter_map(|(_, _, _, _, index)| {
+        .filter_map(|(_, _, _, _, _, index)| {
             apps[index]
                 .identity
                 .as_ref()
@@ -275,6 +279,23 @@ mod tests {
         common.identity = user.identity.clone();
         common.common_shortcut = true;
         assert_eq!(search(&[common, user], "editor"), [1]);
+    }
+
+    #[test]
+    fn prefers_the_regular_shortcut_but_keeps_startup_searchable_by_folder() {
+        let mut regular = app("MailCraft");
+        regular.identity = Some(Identity::LocalFile(7, [1; 16]));
+        regular.common_shortcut = true;
+        let mut startup = App::new(
+            "MailCraft".into(),
+            Some("Startup".into()),
+            Source::Desktop(PathBuf::from(r"C:\User\Startup\MailCraft.lnk")),
+        );
+        startup.identity = regular.identity.clone();
+        startup.startup_shortcut = true;
+        let apps = [startup, regular];
+        assert_eq!(search(&apps, "mailcraft"), [1]);
+        assert_eq!(search(&apps, "startup"), [0]);
     }
 
     #[test]
