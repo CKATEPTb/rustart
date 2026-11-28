@@ -56,24 +56,38 @@ impl Drop for Icon {
 
 type Entry = (Key, Option<Icon>);
 
+struct CachedIcon {
+    key: Key,
+    icon: Option<Icon>,
+    fresh: bool,
+}
+
 #[derive(Default)]
-struct Cache(VecDeque<Entry>);
+struct Cache(VecDeque<CachedIcon>);
 
 impl Cache {
     fn touch(&mut self, key: &Key) -> bool {
-        if let Some(index) = self.0.iter().position(|(cached, _)| cached == key) {
+        if let Some(index) = self.0.iter().position(|entry| &entry.key == key) {
             let entry = self.0.remove(index).unwrap();
+            let fresh = entry.fresh;
             self.0.push_back(entry);
-            return true;
+            return fresh;
         }
         false
     }
 
     fn insert(&mut self, key: Key, icon: Option<Icon>) {
-        if let Some(index) = self.0.iter().position(|(cached, _)| cached == &key) {
-            self.0.remove(index);
-        }
-        self.0.push_back((key, icon));
+        let previous = self
+            .0
+            .iter()
+            .position(|entry| entry.key == key)
+            .and_then(|index| self.0.remove(index));
+        // A failed Shell lookup during refresh can keep using the last good icon.
+        self.0.push_back(CachedIcon {
+            key,
+            icon: icon.or_else(|| previous.and_then(|entry| entry.icon)),
+            fresh: true,
+        });
         if self.0.len() > CACHE_LIMIT {
             self.0.pop_front();
         }
@@ -82,8 +96,8 @@ impl Cache {
     fn get(&self, source: &Source, px: i32) -> Option<&Icon> {
         self.0
             .iter()
-            .find(|(key, _)| &key.source == source && key.px == px)
-            .and_then(|(_, icon)| icon.as_ref())
+            .find(|entry| &entry.key.source == source && entry.key.px == px)
+            .and_then(|entry| entry.icon.as_ref())
     }
 }
 
@@ -183,13 +197,20 @@ impl Loader {
             .cloned()
             .collect();
         self.visible = visible;
+        self.queue(pending, true);
+    }
 
+    fn queue(&mut self, pending: VecDeque<Key>, replace_viewport: bool) {
         if self.shared.is_none() && !pending.is_empty() {
             self.shared = Some(Arc::new(Shared::default()));
         }
         if let Some(shared) = &self.shared {
             let mut work = shared.work.lock().unwrap();
-            work.replace(pending);
+            if replace_viewport {
+                work.replace(pending);
+            } else {
+                work.pending.extend(pending);
+            }
             if !work.pending.is_empty() {
                 work.stop_when_idle = false;
                 if !work.worker_running {
@@ -231,6 +252,21 @@ impl Loader {
     pub(super) fn clear(&mut self) {
         self.request(std::iter::empty(), 0);
         self.cache.0.clear();
+    }
+
+    pub(super) fn catalog_changed(&mut self) {
+        let mut refresh = VecDeque::new();
+        for entry in &mut self.cache.0 {
+            if entry.fresh && self.visible.contains(&entry.key) {
+                refresh.push_back(entry.key.clone());
+            }
+            entry.fresh = false;
+        }
+        // Keep in-flight extractions and their results when another scan
+        // finishes before the worker has delivered the refreshed icon.
+        if !refresh.is_empty() {
+            self.queue(refresh, false);
+        }
     }
 
     pub(super) fn release(&mut self) {
@@ -371,6 +407,111 @@ mod tests {
             source: Source::Packaged(index.to_string()),
             px: 34,
         }
+    }
+
+    #[test]
+    fn catalog_refresh_keeps_loaded_icons_until_worker_delivery() {
+        use crate::{catalog::App, overlay};
+        use std::ptr::null_mut;
+        use windows_sys::{
+            Win32::{
+                Foundation::RECT,
+                UI::WindowsAndMessaging::{
+                    CopyIcon, DestroyWindow, GWLP_USERDATA, GetWindowLongPtrW, IDI_APPLICATION,
+                    LB_GETCOUNT, LoadIconW, SW_SHOWNOACTIVATE, SendMessageW, SetWindowTextW,
+                    ShowWindow,
+                },
+            },
+            core::w,
+        };
+
+        fn app(name: &str) -> App {
+            serde_json::from_value(serde_json::json!({
+                "name": name, "detail": "", "source": Source::Packaged(name.into()),
+                "search_name": name.to_lowercase(), "search_context": "",
+                "source_sort_key": name, "common_shortcut": false
+            }))
+            .unwrap()
+        }
+
+        struct Window(HWND);
+        impl Drop for Window {
+            fn drop(&mut self) {
+                unsafe { DestroyWindow(self.0) };
+            }
+        }
+
+        let window = Window(overlay::create(null_mut()).unwrap());
+        let state =
+            unsafe { &*(GetWindowLongPtrW(window.0, GWLP_USERDATA) as *const overlay::State) };
+        state.geometry.set(overlay::Geometry {
+            area: RECT {
+                left: -32_000,
+                top: -32_000,
+                right: -31_000,
+                bottom: -31_000,
+            },
+            ..Default::default()
+        });
+        // Leave pending requests in the queue, as if extraction were slow.
+        let shared = Arc::new(Shared::default());
+        shared.work.lock().unwrap().worker_running = true;
+        state.icons.borrow_mut().shared = Some(Arc::clone(&shared));
+
+        let result = app("Demo B");
+        overlay::set_catalog(window.0, vec![result.clone()]);
+        overlay::view::layout(window.0, state);
+        unsafe {
+            ShowWindow(window.0, SW_SHOWNOACTIVATE);
+            SetWindowTextW(state.edit.get(), w!("Demo"));
+        }
+        let px = state.icon_px.get();
+        assert!(px > 0);
+        let new_icon =
+            || Icon::from_raw(unsafe { CopyIcon(LoadIconW(null_mut(), IDI_APPLICATION)) }).unwrap();
+        let icon = new_icon();
+        let handle = icon.raw();
+        let key = Key {
+            source: result.source.clone(),
+            px,
+        };
+        let deliver = |icon| {
+            let mut work = shared.work.lock().unwrap();
+            let slot = work
+                .pending
+                .iter()
+                .position(|pending| pending == &key)
+                .unwrap();
+            let request = work.pending.remove(slot).unwrap();
+            let generation = work.generation;
+            assert!(work.finish(generation, (request, icon)));
+            drop(work);
+            state.icons.borrow_mut().collect()
+        };
+        assert!(deliver(Some(icon)));
+        assert_eq!(state.app_icon(0), handle);
+
+        overlay::set_catalog(window.0, vec![result.clone()]);
+        assert_eq!(state.app_icon(0), handle);
+        overlay::set_catalog(window.0, vec![result.clone()]);
+        assert_eq!(shared.work.lock().unwrap().pending.len(), 1);
+        assert!(!deliver(None));
+        assert_eq!(state.app_icon(0), handle);
+        overlay::set_catalog(window.0, vec![app("Demo A"), result.clone()]);
+        assert_eq!(state.app_icon(1), handle);
+        assert_eq!(overlay::selected_source(state), Some(result.source.clone()));
+        assert_eq!(
+            unsafe { SendMessageW(state.list.get(), LB_GETCOUNT, 0, 0) },
+            2
+        );
+        let replacement = new_icon();
+        let new_handle = replacement.raw();
+        assert_ne!(handle, new_handle);
+        assert!(deliver(Some(replacement)));
+        assert_eq!(state.app_icon(1), new_handle);
+        unsafe { SetWindowTextW(state.edit.get(), w!("Demo B")) };
+        assert_eq!(overlay::selected_source(state), Some(result.source));
+        assert_eq!(state.app_icon(1), new_handle);
     }
 
     #[test]

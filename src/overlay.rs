@@ -322,28 +322,25 @@ pub(crate) fn showing_app_search(hwnd: HWND) -> bool {
 }
 
 pub fn set_catalog(hwnd: HWND, apps: Vec<App>) {
-    update(hwnd, |state| {
-        // Child messages can repaint between replacing the catalog and
-        // rebuilding the list. Old result indices belong to the old catalog.
-        state.results.replace(Results::Empty);
-        state.icons.borrow_mut().clear();
-        state.apps.replace(apps);
-    });
-}
-
-// The runtime calls these setters on the overlay's UI thread. Keeping the data
-// in-process avoids transferring Rust pointers through public window messages.
-fn update(hwnd: HWND, apply: impl FnOnce(&State)) {
+    // The runtime publishes on the overlay's UI thread.
     unsafe {
         let ptr = GetWindowLongPtrW(hwnd, GWLP_USERDATA) as *const State;
         if let Some(state) = ptr.as_ref() {
+            // A shortcut's icon can change without changing its catalog entry.
+            state.icons.borrow_mut().catalog_changed();
+            if *state.apps.borrow() == apps {
+                return;
+            }
             let visible = IsWindowVisible(hwnd) != 0;
             let selected = if visible {
                 selected_source(state)
             } else {
                 None
             };
-            apply(state);
+            // Child messages can repaint while the native list is rebuilt.
+            // Old result indices belong to the old catalog.
+            state.results.replace(Results::Empty);
+            state.apps.replace(apps);
             if visible {
                 refresh_results(hwnd, state, selected.as_ref());
             }
