@@ -67,7 +67,7 @@ struct App {
     overlay: HWND,
     prefs: Rc<Prefs>,
     shortcut: Option<Binding>,
-    fetching: Option<mpsc::Receiver<Result<Vec<catalog::App>, String>>>,
+    fetching: Option<mpsc::Receiver<IndexUpdate>>,
     pending_index: PendingIndex,
     debounce: Option<Instant>,
     watch: Option<catalog_watch::Watch>,
@@ -76,6 +76,11 @@ struct App {
     warning: Option<String>,
 }
 thread_local! { static APP: RefCell<Option<App>> = const { RefCell::new(None) }; }
+
+struct IndexUpdate {
+    apps: Result<Vec<catalog::App>, String>,
+    steam: catalog_watch::SteamFolders,
+}
 
 struct PendingIndex {
     dirty: bool,
@@ -157,7 +162,11 @@ pub(crate) fn update_language(language: Option<crate::i18n::Language>) -> Result
 fn prepare_watch() {
     let target = APP.with_borrow_mut(|s| {
         let s = s.as_mut()?;
-        if s.preparing_watch || s.watch.as_ref().is_some_and(catalog_watch::Watch::complete) {
+        if s.preparing_watch
+            || s.watch
+                .as_ref()
+                .is_some_and(catalog_watch::Watch::desktop_complete)
+        {
             return None;
         }
         s.preparing_watch = true;
@@ -223,8 +232,18 @@ fn request_index() {
     let worker = std::thread::Builder::new()
         .name("rustart-index".into())
         .spawn(move || {
-            let result = catalog::discover_isolated();
-            if tx.send(result).is_ok() {
+            // Subscribe before discovery so changes during the scan remain
+            // signalled even before the UI starts waiting on these folders.
+            let mut folders = catalog::steam_library_folders();
+            if let Some(primary) = folders.first()
+                && !primary.join("libraryfolders.vdf").is_file()
+                && let Some(root) = primary.parent()
+            {
+                folders.push(root.join("config"));
+            }
+            let steam = catalog_watch::SteamFolders::open(&folders);
+            let apps = catalog::discover_isolated();
+            if tx.send(IndexUpdate { apps, steam }).is_ok() {
                 unsafe {
                     PostMessageW(owner as HWND, INDEX_READY, 0, 0);
                 }
@@ -246,7 +265,12 @@ fn receive_index(overlay: HWND) {
     let result = APP.with_borrow_mut(|app| {
         let s = app.as_mut()?;
         let result = match s.fetching.as_ref()?.try_recv() {
-            Ok(result) => result,
+            Ok(update) => {
+                if let Some(watch) = &mut s.watch {
+                    watch.steam = update.steam;
+                }
+                update.apps
+            }
             Err(mpsc::TryRecvError::Empty) => return None,
             Err(mpsc::TryRecvError::Disconnected) => Err("Индексирование было прервано.".into()),
         };
@@ -270,13 +294,17 @@ fn open_index(owner: HWND, overlay: HWND, explicit: bool) {
         return;
     }
     prepare_watch();
-    if explicit {
-        APP.with_borrow_mut(|s| {
-            if let Some(state) = s {
-                state.pending_index.invalidate(true);
-            }
-        });
-    }
+    APP.with_borrow_mut(|s| {
+        if let Some(state) = s
+            && (explicit
+                || state
+                    .watch
+                    .as_ref()
+                    .is_some_and(|watch| !watch.steam.complete))
+        {
+            state.pending_index.invalidate(explicit);
+        }
+    });
     cancel_debounce(owner);
     request_index();
 }
@@ -588,12 +616,15 @@ fn run_loop() -> Result<(), String> {
         return Err(err);
     }
     let mut msg = MSG::default();
+    let mut handles = Vec::new();
     let result = loop {
-        let (handles, count) = APP.with_borrow(|s| {
-            s.as_ref()
-                .and_then(|state| state.watch.as_ref())
-                .map_or(([null_mut(); 2], 0), catalog_watch::Watch::handles)
+        handles.clear();
+        APP.with_borrow(|s| {
+            if let Some(watch) = s.as_ref().and_then(|state| state.watch.as_ref()) {
+                watch.handles(&mut handles);
+            }
         });
+        let count = handles.len() as u32;
         let next = if count == 0 {
             unsafe { GetMessageW(&mut msg, null_mut(), 0, 0) }
         } else {

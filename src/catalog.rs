@@ -8,12 +8,18 @@ use std::{collections::HashSet, path::PathBuf};
 
 pub(crate) use native::current_user_sid;
 pub use native::{discover, launch, reveal, standard_launch_worker};
+pub(crate) use native::{steam_icon, steam_library_folders};
 pub use wire::{discover_isolated, write_discovery};
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 pub enum Source {
     Desktop(#[serde(with = "wire::windows_path")] PathBuf),
     Packaged(String),
+    Steam {
+        app_id: u32,
+        #[serde(with = "wire::windows_path")]
+        install_dir: PathBuf,
+    },
 }
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
@@ -39,16 +45,21 @@ impl App {
         let source_sort_key = match &source {
             Source::Desktop(path) => path.to_string_lossy().to_lowercase(),
             Source::Packaged(id) => id.to_lowercase(),
+            Source::Steam { app_id, .. } => app_id.to_string(),
         };
         let detail = context.unwrap_or_else(|| match &source {
             Source::Desktop(_) => "Меню «Пуск»".into(),
             Source::Packaged(_) => "Приложение Windows".into(),
+            Source::Steam { .. } => "Steam".into(),
         });
         let aumid = match &source {
             Source::Packaged(id) => Some(id.to_ascii_lowercase()),
-            Source::Desktop(_) => None,
+            Source::Desktop(_) | Source::Steam { .. } => None,
         };
-        let identity = aumid.clone().map(Identity::Packaged);
+        let identity = match source {
+            Source::Steam { app_id, .. } => Some(Identity::Steam(app_id)),
+            _ => aumid.clone().map(Identity::Packaged),
+        };
         Self {
             name,
             detail,
@@ -83,6 +94,7 @@ fn describe_name_collisions(apps: &mut [App]) {
                     .unwrap_or_else(|| match &app.source {
                         Source::Desktop(path) => path.to_string_lossy().into_owned(),
                         Source::Packaged(id) => id.clone(),
+                        Source::Steam { install_dir, .. } => install_dir.display().to_string(),
                     });
             }
         }

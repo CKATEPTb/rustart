@@ -1,6 +1,6 @@
 # Rustart
 
-Rustart is a simple, lightweight app launcher for Windows, written in Rust. Press **Win+R** and type a name to find desktop and Microsoft Store apps in your Start menu, or type a math expression to see the result. Rustart is free and open source under the [MIT license](LICENSE).
+Rustart is a simple, lightweight app launcher for Windows, written in Rust. Press **Win+R** and type a name to find Start menu apps, Microsoft Store apps and installed games from your Steam libraries. You can also type a math expression to see the result. Rustart is free and open source under the [MIT license](LICENSE).
 
 ![Rustart showing Microsoft Edge and Microsoft Store for the query “Microsoft”](assets/readme/search.png)
 

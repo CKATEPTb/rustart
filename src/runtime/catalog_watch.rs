@@ -2,7 +2,6 @@ use std::{
     ffi::OsString,
     os::windows::ffi::{OsStrExt, OsStringExt},
     path::{Path, PathBuf},
-    ptr::null_mut,
     sync::{
         Arc,
         atomic::{AtomicBool, Ordering},
@@ -31,6 +30,7 @@ use windows_sys::Win32::{
         FILE_NOTIFY_CHANGE_LAST_WRITE, FILE_NOTIFY_CHANGE_SIZE, FindCloseChangeNotification,
         FindFirstChangeNotificationW, FindNextChangeNotification,
     },
+    System::SystemServices::MAXIMUM_WAIT_OBJECTS,
     UI::WindowsAndMessaging::PostMessageW,
 };
 
@@ -38,7 +38,31 @@ use super::PACKAGE_CHANGED;
 
 pub(super) struct Watch {
     folders: [Option<Folder>; 2],
+    pub(super) steam: SteamFolders,
     package: Option<Packages>,
+}
+
+// MsgWaitForMultipleObjectsEx also waits for the message queue. Reserve a
+// further two handles for the user's and the shared Start menu folders.
+const MAX_STEAM_FOLDERS: usize = MAXIMUM_WAIT_OBJECTS as usize - 1 - 2;
+
+pub(super) struct SteamFolders {
+    folders: Vec<Folder>,
+    pub(super) complete: bool,
+}
+
+impl SteamFolders {
+    pub(super) fn open(roots: &[PathBuf]) -> Self {
+        let folders: Vec<_> = roots
+            .iter()
+            .take(MAX_STEAM_FOLDERS)
+            .filter_map(|root| Folder::open(root, false))
+            .collect();
+        Self {
+            complete: folders.len() == roots.len(),
+            folders,
+        }
+    }
 }
 
 impl Watch {
@@ -51,42 +75,52 @@ impl Watch {
                 (&FOLDERID_CommonPrograms, &FOLDERID_CommonStartMenu),
             ]
             .map(|(programs, menu)| Folder::new(programs, menu)),
+            steam: SteamFolders::open(&[]),
             package: Packages::new(owner, signal),
         }
     }
 
-    pub(super) fn complete(&self) -> bool {
+    pub(super) fn desktop_complete(&self) -> bool {
         self.folders.iter().all(Option::is_some)
             && self.package.as_ref().is_some_and(Packages::complete)
     }
 
-    pub(super) fn handles(&self) -> ([HANDLE; 2], u32) {
-        let mut handles = [null_mut(); 2];
-        let mut count = 0;
-        for folder in self.folders.iter().flatten() {
-            handles[count] = folder.0;
-            count += 1;
-        }
-        (handles, count as u32)
+    pub(super) fn handles(&self, handles: &mut Vec<HANDLE>) {
+        handles.extend(
+            self.folders
+                .iter()
+                .flatten()
+                .chain(&self.steam.folders)
+                .map(|folder| folder.0),
+        );
     }
 
     pub(super) fn rearm(&mut self, handle: HANDLE) {
+        if unsafe { FindNextChangeNotification(handle) } != 0 {
+            return;
+        }
         for folder in &mut self.folders {
-            if folder.as_ref().is_some_and(|folder| folder.0 == handle)
-                && unsafe { FindNextChangeNotification(handle) } == 0
-            {
+            if folder.as_ref().is_some_and(|folder| folder.0 == handle) {
                 *folder = None;
                 return;
             }
         }
+        self.steam.folders.retain(|folder| folder.0 != handle);
+        self.steam.complete = false;
     }
 
     pub(super) fn stop_folders(&mut self) {
         self.folders = [None, None];
+        self.steam.folders.clear();
+        self.steam.complete = false;
     }
 }
 
 struct Folder(HANDLE);
+
+// Directory change notifications can be opened and waited on by different
+// threads. Ownership moves once, from the indexer to the UI's wait loop.
+unsafe impl Send for Folder {}
 
 impl Folder {
     fn new(programs: &GUID, menu: &GUID) -> Option<Self> {
@@ -99,15 +133,15 @@ impl Folder {
                     .is_some_and(|parent| parent.as_os_str().eq_ignore_ascii_case(menu.as_os_str()))
             })
             .unwrap_or(programs);
-        Self::open(&root)
+        Self::open(&root, true)
     }
 
-    fn open(root: &Path) -> Option<Self> {
+    fn open(root: &Path, recursive: bool) -> Option<Self> {
         let path: Vec<_> = root.as_os_str().encode_wide().chain([0]).collect();
         let handle = unsafe {
             FindFirstChangeNotificationW(
                 path.as_ptr(),
-                1,
+                i32::from(recursive),
                 FILE_NOTIFY_CHANGE_FILE_NAME
                     | FILE_NOTIFY_CHANGE_DIR_NAME
                     | FILE_NOTIFY_CHANGE_ATTRIBUTES
@@ -246,27 +280,38 @@ mod tests {
         fs,
         time::{SystemTime, UNIX_EPOCH},
     };
-    use windows_sys::Win32::{Foundation::WAIT_OBJECT_0, System::Threading::WaitForSingleObject};
+    use windows_sys::Win32::{
+        Foundation::{WAIT_OBJECT_0, WAIT_TIMEOUT},
+        System::Threading::WaitForSingleObject,
+    };
+
+    struct Fixture(PathBuf);
+
+    impl Fixture {
+        fn new() -> Self {
+            let tick = SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap()
+                .as_nanos();
+            let path =
+                std::env::temp_dir().join(format!("Rustart.Watch.{}.{tick}", std::process::id()));
+            fs::create_dir(&path).unwrap();
+            Self(path)
+        }
+    }
+
+    impl Drop for Fixture {
+        fn drop(&mut self) {
+            let _ = fs::remove_dir_all(&self.0);
+        }
+    }
 
     #[test]
     fn directory_watch_reports_nested_creation_changes_and_deletion() {
-        let tick = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .unwrap()
-            .as_nanos();
-        let path =
-            std::env::temp_dir().join(format!("Rustart.Watch.{}.{tick}", std::process::id()));
-        fs::create_dir(&path).unwrap();
-        struct Cleanup(PathBuf);
-        impl Drop for Cleanup {
-            fn drop(&mut self) {
-                let _ = fs::remove_dir_all(&self.0);
-            }
-        }
-        let cleanup = Cleanup(path);
+        let cleanup = Fixture::new();
         let nested = cleanup.0.join("nested").join("programs");
         fs::create_dir_all(&nested).unwrap();
-        let watch = Folder::open(&cleanup.0).unwrap();
+        let watch = Folder::open(&cleanup.0, true).unwrap();
         let file = nested.join("test.lnk");
         let wait_and_rearm = || {
             assert_eq!(
@@ -284,8 +329,49 @@ mod tests {
     }
 
     #[test]
+    fn steam_watches_manifests_and_library_configuration_without_watching_game_content() {
+        let root = Fixture::new();
+        let primary = root.0.join("primary").join("steamapps");
+        let secondary = root.0.join("secondary").join("steamapps");
+        let game = secondary.join("common").join("game");
+        fs::create_dir_all(&primary).unwrap();
+        fs::create_dir_all(&game).unwrap();
+        let watch = SteamFolders::open(&[primary.clone(), secondary.clone()]);
+        assert!(watch.complete);
+        fs::write(game.join("game.dat"), b"data").unwrap();
+        let secondary_watch = watch.folders[1].0;
+        assert_eq!(
+            unsafe { WaitForSingleObject(secondary_watch, 50) },
+            WAIT_TIMEOUT
+        );
+        let manifest = secondary.join("appmanifest_42.acf");
+        fs::write(&manifest, b"installed").unwrap();
+        assert_eq!(
+            unsafe { WaitForSingleObject(secondary_watch, 2000) },
+            WAIT_OBJECT_0
+        );
+        assert_ne!(unsafe { FindNextChangeNotification(secondary_watch) }, 0);
+        fs::remove_file(manifest).unwrap();
+        assert_eq!(
+            unsafe { WaitForSingleObject(secondary_watch, 2000) },
+            WAIT_OBJECT_0
+        );
+        fs::write(primary.join("libraryfolders.vdf"), b"changed").unwrap();
+        assert_eq!(
+            unsafe { WaitForSingleObject(watch.folders[0].0, 2000) },
+            WAIT_OBJECT_0
+        );
+        assert!(SteamFolders::open(&[]).complete);
+        assert!(!SteamFolders::open(&[root.0.join("offline")]).complete);
+        let overflow = SteamFolders::open(&vec![primary; MAX_STEAM_FOLDERS + 1]);
+        assert!(!overflow.complete);
+        assert_eq!(overflow.folders.len(), MAX_STEAM_FOLDERS);
+    }
+
+    #[test]
     #[ignore]
     fn probe_unpacked_package_catalog_subscription() {
+        use std::ptr::null_mut;
         use windows_sys::Win32::{
             System::{
                 Com::{

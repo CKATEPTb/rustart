@@ -28,7 +28,7 @@ use windows_sys::Win32::{
     },
 };
 
-use crate::catalog::Source;
+use crate::catalog::{Source, steam_icon};
 
 use super::Icon;
 
@@ -54,10 +54,8 @@ impl Extractor {
     fn item(&self, source: &Source) -> Option<IShellItem> {
         unsafe {
             match source {
-                Source::Desktop(path) => {
-                    let name: Vec<_> = path.as_os_str().encode_wide().chain([0]).collect();
-                    SHCreateItemFromParsingName(PCWSTR(name.as_ptr()), None).ok()
-                }
+                Source::Desktop(path) => file_item(path),
+                Source::Steam { app_id, .. } => file_item(&steam_icon(*app_id)?),
                 Source::Packaged(id) => {
                     let folder = self.apps_folder.get_or_init(|| {
                         SHGetKnownFolderItem(&FOLDERID_AppsFolder, KF_FLAG_DEFAULT, None).ok()
@@ -80,6 +78,11 @@ impl Extractor {
             }
         }
     }
+}
+
+fn file_item(path: &std::path::Path) -> Option<IShellItem> {
+    let name: Vec<_> = path.as_os_str().encode_wide().chain([0]).collect();
+    unsafe { SHCreateItemFromParsingName(PCWSTR(name.as_ptr()), None).ok() }
 }
 
 impl Drop for Extractor {

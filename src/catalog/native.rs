@@ -6,9 +6,11 @@ mod privilege;
 mod reveal;
 mod shortcut;
 mod standard_launch;
+mod steam;
 pub(crate) use privilege::current_user_sid;
 pub use reveal::reveal;
 pub use standard_launch::worker as standard_launch_worker;
+pub(crate) use steam::{steam_icon, steam_library_folders};
 
 use std::{
     collections::HashSet,
@@ -101,6 +103,7 @@ pub fn discover() -> Result<Vec<App>, String> {
     if let Err(error) = packaged_apps(&mut apps, &mut identities) {
         errors.push(error.to_string());
     }
+    steam::discover(&mut apps);
     if apps.is_empty() && !errors.is_empty() {
         return Err(format!(
             "Не удалось загрузить список приложений. {}",
@@ -270,6 +273,7 @@ pub fn launch(source: &Source, name: &str, elevated: bool) -> Result<(), String>
         match source {
             Source::Desktop(path) => elevate_desktop(path).map_err(|error| error.to_string()),
             Source::Packaged(id) => elevate_packaged(id),
+            Source::Steam { .. } => Err(tr(Msg::LaunchElevationUnavailable).into()),
         }
     } else {
         standard_launch::launch(source)

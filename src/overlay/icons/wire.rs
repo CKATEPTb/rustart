@@ -29,15 +29,11 @@ fn tag(input: &mut impl Read) -> io::Result<Option<u8>> {
 
 pub(super) fn write_key(output: &mut impl Write, key: &Key) -> io::Result<()> {
     let (kind, name) = match &key.source {
-        Source::Desktop(path) => (
-            1,
-            path.as_os_str()
-                .encode_wide()
-                .take(MAX_NAME + 1)
-                .collect::<Vec<_>>(),
-        ),
-        Source::Packaged(id) => (2, id.encode_utf16().take(MAX_NAME + 1).collect::<Vec<_>>()),
+        Source::Desktop(path) => (1, path.as_os_str()),
+        Source::Packaged(id) => (2, std::ffi::OsStr::new(id)),
+        Source::Steam { install_dir, .. } => (3, install_dir.as_os_str()),
     };
+    let name: Vec<_> = name.encode_wide().take(MAX_NAME + 1).collect();
     if !(1..=MAX_SIDE as i32).contains(&key.px)
         || !(1..=MAX_NAME).contains(&name.len())
         || name.contains(&0)
@@ -47,6 +43,9 @@ pub(super) fn write_key(output: &mut impl Write, key: &Key) -> io::Result<()> {
     output.write_all(&[kind])?;
     output.write_all(&(key.px as u16).to_le_bytes())?;
     output.write_all(&(name.len() as u16).to_le_bytes())?;
+    if let Source::Steam { app_id, .. } = &key.source {
+        output.write_all(&app_id.to_le_bytes())?;
+    }
     let name: Vec<_> = name.into_iter().flat_map(u16::to_le_bytes).collect();
     output.write_all(&name)?;
     output.flush()
@@ -60,11 +59,15 @@ pub(super) fn read_key(input: &mut impl Read) -> io::Result<Option<Key>> {
     input.read_exact(&mut header)?;
     let px = u16::from_le_bytes([header[0], header[1]]);
     let length = u16::from_le_bytes([header[2], header[3]]) as usize;
-    if !matches!(kind, 1 | 2)
+    if !matches!(kind, 1..=3)
         || !(1..=MAX_SIDE as u16).contains(&px)
         || !(1..=MAX_NAME).contains(&length)
     {
         return Err(invalid());
+    }
+    let mut app_id = [0; 4];
+    if kind == 3 {
+        input.read_exact(&mut app_id)?;
     }
     let mut bytes = vec![0; length * 2];
     input.read_exact(&mut bytes)?;
@@ -77,18 +80,25 @@ pub(super) fn read_key(input: &mut impl Read) -> io::Result<Option<Key>> {
     if name.contains(&0) {
         return Err(invalid());
     }
-    let source = if kind == 1 {
-        let path = std::path::PathBuf::from(std::ffi::OsString::from_wide(&name));
-        if !path.is_absolute() {
-            return Err(invalid());
-        }
-        Source::Desktop(path)
-    } else {
+    let source = if kind == 2 {
         let id = String::from_utf16(&name).map_err(|_| invalid())?;
         if id.contains(['\\', '/']) {
             return Err(invalid());
         }
         Source::Packaged(id)
+    } else {
+        let path = std::path::PathBuf::from(std::ffi::OsString::from_wide(&name));
+        if !path.is_absolute() {
+            return Err(invalid());
+        }
+        if kind == 3 {
+            Source::Steam {
+                app_id: u32::from_le_bytes(app_id),
+                install_dir: path,
+            }
+        } else {
+            Source::Desktop(path)
+        }
     };
     Ok(Some(Key {
         source,
@@ -355,6 +365,20 @@ impl Drop for Dc {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn steam_icon_key_survives_the_worker_pipe() {
+        let key = Key {
+            source: Source::Steam {
+                app_id: 291550,
+                install_dir: r"D:\SteamLibrary\steamapps\common\Игра".into(),
+            },
+            px: 32,
+        };
+        let mut bytes = Vec::new();
+        write_key(&mut bytes, &key).unwrap();
+        assert!(read_key(&mut bytes.as_slice()).unwrap() == Some(key));
+    }
 
     #[test]
     fn wire_preserves_bgra_and_legacy_xor_and_masks() {

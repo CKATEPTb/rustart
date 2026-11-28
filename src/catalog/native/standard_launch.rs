@@ -146,6 +146,11 @@ fn execute(source: &Source, operation: Operation) -> Result<(), String> {
             None => Err(tr(Msg::LaunchUnsupported).into()),
         },
         Source::Packaged(id) => activate_package(id),
+        Source::Steam { app_id, .. } => {
+            let (client, arguments) = super::steam::launch_target(*app_id)
+                .ok_or_else(|| tr(Msg::LaunchUnsupported).to_owned())?;
+            create_process(&client, &arguments, None, None).map_err(|error| error.to_string())
+        }
     }
 }
 

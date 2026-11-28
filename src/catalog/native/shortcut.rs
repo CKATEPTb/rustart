@@ -90,6 +90,11 @@ impl Index {
     }
 
     pub(super) fn identify(&mut self, source: &Path) -> Option<(Identity, Option<String>)> {
+        if source.extension()?.eq_ignore_ascii_case("url") {
+            let uri = super::internet_shortcut::read_shortcut(source)?;
+            let id = super::internet_shortcut::steam_id(&uri)?;
+            return Some((Identity::Steam(id), None));
+        }
         if source.extension()?.eq_ignore_ascii_case("exe") {
             return self.binary(source);
         }
@@ -112,6 +117,23 @@ impl Index {
         };
 
         let path = executable_path(&target)?;
+        if target
+            .file_name()
+            .is_some_and(|name| name.eq_ignore_ascii_case("steam.exe"))
+            && super::steam::executable()
+                .and_then(|client| executable_path(&client))
+                .as_deref()
+                == Some(path.as_str())
+        {
+            let mut args = vec![0; 32768];
+            if unsafe { link.GetArguments(&mut args) }.is_ok()
+                && let Some(args) =
+                    nul_terminated(&args).and_then(|units| String::from_utf16(units).ok())
+                && let Some(id) = steam_shortcut_id(&args)
+            {
+                return Some((Identity::Steam(id), None));
+            }
+        }
         if self.explorer_path.as_deref() == Some(path.as_str())
             && let Some(id) = explorer_app(&link)
         {
@@ -175,6 +197,25 @@ impl Index {
         let id =
             unsafe { SHGetNameFromIDList(target.0.as_ptr(), SIGDN_PARENTRELATIVEPARSING).ok()? };
         packaged_id(owned_string(id).to_str()?)
+    }
+}
+
+fn steam_shortcut_id(arguments: &str) -> Option<u32> {
+    fn unquote(value: &str) -> &str {
+        value
+            .strip_prefix('"')
+            .and_then(|value| value.strip_suffix('"'))
+            .unwrap_or(value)
+    }
+    let mut words = arguments.split_whitespace();
+    match (words.next()?, words.next(), words.next()) {
+        (flag, Some(id), None) if flag.eq_ignore_ascii_case("-applaunch") => {
+            super::steam::app_id(unquote(id))
+        }
+        ("--", Some(uri), None) | (uri, None, None) => {
+            super::internet_shortcut::steam_id(unquote(uri))
+        }
+        _ => None,
     }
 }
 
@@ -495,6 +536,25 @@ fn collapse_parents(path: &Path) -> Option<PathBuf> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn recognizes_game_shortcuts_with_their_own_app_id() {
+        for args in [
+            r#"-applaunch "291550""#,
+            r#"-- "steam://rungameid/291550""#,
+            "steam://run/291550",
+        ] {
+            assert_eq!(steam_shortcut_id(args), Some(291550));
+        }
+        for args in [
+            "-silent",
+            "-applaunch 7 -extra",
+            "-applaunch +7",
+            "steam://install/7",
+        ] {
+            assert_eq!(steam_shortcut_id(args), None);
+        }
+    }
 
     #[test]
     fn resolves_only_the_control_panel_namespace_link_as_a_standard_process() {

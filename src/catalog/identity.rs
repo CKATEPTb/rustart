@@ -7,6 +7,7 @@ pub(super) enum Identity {
     Executable(String),
     LocalFile(u64, [u8; 16]),
     Packaged(String),
+    Steam(u32),
 }
 
 pub(super) fn packaged_id(id: &str) -> Option<String> {

@@ -44,10 +44,25 @@ pub(super) fn direct_target(source: &Path) -> Option<(PathBuf, OsString)> {
         return None;
     }
     let uri = read_shortcut(source)?;
+    if let Some(app_id) = steam_id(&uri) {
+        return super::steam::launch_target(app_id);
+    }
     resolve_association(&uri)
 }
 
-fn read_shortcut(source: &Path) -> Option<String> {
+pub(super) fn steam_id(uri: &str) -> Option<u32> {
+    let (scheme, route) = uri.split_once("://")?;
+    let (action, id) = route.split_once('/')?;
+    let id = id.strip_suffix('/').unwrap_or(id);
+    if !scheme.eq_ignore_ascii_case("steam")
+        || !(action.eq_ignore_ascii_case("rungameid") || action.eq_ignore_ascii_case("run"))
+    {
+        return None;
+    }
+    super::steam::app_id(id)
+}
+
+pub(super) fn read_shortcut(source: &Path) -> Option<String> {
     let path: Vec<_> = source.as_os_str().encode_wide().chain([0]).collect();
     unsafe {
         let link: IUniformResourceLocatorW =
@@ -302,6 +317,41 @@ fn terminated(input: &[u16]) -> Option<OsString> {
 mod tests {
     use super::*;
     use std::{ffi::OsStr, fs};
+
+    #[test]
+    fn extracts_only_numeric_steam_game_launches() {
+        for uri in ["steam://rungameid/291550", "STEAM://Run/291550/"] {
+            assert_eq!(steam_id(uri), Some(291550));
+        }
+        for uri in [
+            "https://run/7",
+            "steam://install/7",
+            "steam://run/0",
+            "steam://run/4294967296",
+            "steam://run/7/extra",
+            "steam://run/7?flag",
+        ] {
+            assert!(steam_id(uri).is_none(), "{uri}");
+        }
+    }
+
+    #[test]
+    #[ignore = "requires an installed Steam client and RUSTART_TEST_STEAM_URL"]
+    fn game_shortcut_and_library_prepare_the_same_client_command() {
+        let _apartment = super::super::Apartment::enter().unwrap();
+        let shortcut = PathBuf::from(std::env::var_os("RUSTART_TEST_STEAM_URL").unwrap());
+        let id = steam_id(&read_shortcut(&shortcut).unwrap()).unwrap();
+        let (client, args) = direct_target(&shortcut).unwrap();
+        assert!(
+            client.is_file()
+                && client
+                    .file_name()
+                    .unwrap()
+                    .eq_ignore_ascii_case("steam.exe")
+        );
+        assert_eq!(args, OsString::from(format!("-applaunch {id}")));
+        assert_eq!(super::super::steam::launch_target(id), Some((client, args)));
+    }
 
     #[test]
     fn uses_the_registered_executable_and_keeps_the_url_in_one_argument() {

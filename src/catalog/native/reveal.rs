@@ -38,6 +38,7 @@ pub(super) fn reveal_standard(
     match source {
         Source::Desktop(source) => reveal_desktop(source, desktop),
         Source::Packaged(id) => reveal_packaged(id, desktop),
+        Source::Steam { install_dir, .. } => desktop.explore(install_dir),
     }
 }
 
