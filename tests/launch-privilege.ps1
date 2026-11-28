@@ -2,7 +2,8 @@
 [CmdletBinding()]
 param(
     [string]$Exe = (Join-Path $PSScriptRoot '../target/release/rustart.exe'),
-    [switch]$RequireHigh
+    [switch]$RequireHigh,
+    [switch]$CheckConsent
 )
 $ErrorActionPreference = 'Stop'
 $Exe = (Resolve-Path -LiteralPath $Exe).Path
@@ -34,7 +35,7 @@ Require ($shellSid -eq $identity.User.Value) 'This fixture requires a split-toke
 function Read-Exact([IO.Stream]$stream, [int]$length) {
     $data = [byte[]]::new($length)
     $offset = 0
-    $deadline = [datetime]::UtcNow.AddSeconds(35)
+    $deadline = [datetime]::UtcNow.AddSeconds($(if ($CheckConsent) { 180 } else { 35 }))
     while ($offset -lt $length) {
         $remaining = [math]::Max(1, ($deadline - [datetime]::UtcNow).TotalMilliseconds)
         $read = $stream.ReadAsync($data, $offset, $length - $offset)
@@ -143,38 +144,36 @@ try {
             ConsoleInput = $result.ConsoleInput; ConsoleOutput = $result.ConsoleOutput; ConsoleWindow = $result.ConsoleWindow }
     }
 
-    # Neither a requireAdministrator manifest nor the RunAsUser shortcut bit
-    # should cause a UAC request through the normal action.
-    $adminLink = New-ProbeLink 'requires-admin' $administrator
-    $flagged = New-ProbeLink 'runas-shortcut' $desktop
-    $bytes = [IO.File]::ReadAllBytes($flagged)
-    Require ($bytes.Length -ge 24 -and [BitConverter]::ToInt32($bytes, 0) -eq 76) 'Unexpected shortcut header.'
-    $flags = [BitConverter]::GetBytes([uint32]([BitConverter]::ToUInt32($bytes, 20) -bor 0x2000))
-    [Array]::Copy($flags, 0, $bytes, 20, 4)
-    [IO.File]::WriteAllBytes($flagged, $bytes)
-    foreach ($path in @($adminLink, $flagged)) {
-        $name = [IO.Path]::GetFileNameWithoutExtension($path)
-        $reply = Invoke-Launch $path
-        Require ($reply.Err -match 'requires administrator privileges') "Expected an explicit elevation error for $name, got $($reply.Err)."
-        Require (![IO.File]::Exists((Join-Path $scratch "ran-$name.marker"))) 'An elevation-only fixture unexpectedly launched.'
-        [pscustomobject]@{ Fixture = $name; CallerHigh = $high; Denied = $true; Error = $reply.Err }
+    $adminCases = @()
+    if ($CheckConsent) {
+        # Interactive check: approve both Windows consent prompts.
+        $adminCases += [pscustomobject]@{ Link = New-ProbeLink 'requires-admin' $administrator; Elevated = $false }
+        $flagged = New-ProbeLink 'runas-shortcut' $desktop
+        $bytes = [IO.File]::ReadAllBytes($flagged)
+        Require ($bytes.Length -ge 24 -and [BitConverter]::ToInt32($bytes, 0) -eq 76) 'Unexpected shortcut header.'
+        $flags = [BitConverter]::GetBytes([uint32]([BitConverter]::ToUInt32($bytes, 20) -bor 0x2000))
+        [Array]::Copy($flags, 0, $bytes, 20, 4)
+        [IO.File]::WriteAllBytes($flagged, $bytes)
+        $adminCases += [pscustomobject]@{ Link = $flagged; Elevated = $false }
     }
     if ($RequireHigh) {
-        # The caller and its shell-action worker are already elevated.
-        $link = New-ProbeLink 'explicit-admin' $administrator
-        $reply = Invoke-Launch $link $true
-        Require ($reply.PSObject.Properties.Name -contains 'Ok') "Explicit administrator launch failed: $($reply.Err)"
-        $marker = Join-Path $scratch 'ran-explicit-admin.marker'
+        $adminCases += [pscustomobject]@{ Link = New-ProbeLink 'explicit-admin' $administrator; Elevated = $true }
+    }
+    foreach ($case in $adminCases) {
+        $name = [IO.Path]::GetFileNameWithoutExtension($case.Link)
+        $reply = Invoke-Launch $case.Link $case.Elevated
+        Require ($reply.PSObject.Properties.Name -contains 'Ok') "Administrator launch failed for ${name}: $($reply.Err)"
+        $marker = Join-Path $scratch "ran-$name.marker"
         $deadline = [datetime]::UtcNow.AddSeconds(10)
         while (![IO.File]::Exists($marker) -and [datetime]::UtcNow -lt $deadline) { Start-Sleep -Milliseconds 20 }
-        Require ([IO.File]::Exists($marker)) 'The explicit administrator fixture did not write its token.'
+        Require ([IO.File]::Exists($marker)) "Missing token for $name."
         $result = @{}
         foreach ($line in Get-Content -LiteralPath $marker) {
             $key, $value = $line -split '=', 2
             $result[$key] = $value
         }
-        Require ($result.Elevation -eq '1' -and [int]$result.Integrity -ge 12288) 'Explicit administrator launch did not use a high token.'
-        [pscustomobject]@{ Fixture = 'explicit-admin'; CallerHigh = $high; TargetElevation = $result.Elevation;
+        Require ($result.Elevation -eq '1' -and [int]$result.Integrity -ge 12288) "The $name fixture did not use a high token."
+        [pscustomobject]@{ Fixture = $name; CallerHigh = $high; TargetElevation = $result.Elevation;
             TargetIntegrity = $result.Integrity; TargetSid = $result.Sid }
     }
 } finally {

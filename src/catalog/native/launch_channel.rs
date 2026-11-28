@@ -27,7 +27,7 @@ use windows_sys::Win32::{
             ConnectNamedPipe, CreateNamedPipeW, GetNamedPipeClientProcessId,
             GetNamedPipeServerProcessId, PIPE_REJECT_REMOTE_CLIENTS, PIPE_TYPE_BYTE, PIPE_WAIT,
         },
-        Threading::{CreateEventW, WaitForSingleObject},
+        Threading::{CreateEventW, INFINITE, WaitForSingleObject},
     },
 };
 
@@ -38,7 +38,7 @@ const DEADLINE: Duration = Duration::from_secs(15);
 
 pub(super) struct Channel {
     handle: OwnedHandle,
-    deadline: Instant,
+    deadline: Option<Instant>,
 }
 
 impl Channel {
@@ -104,8 +104,16 @@ impl Channel {
     fn new(handle: OwnedHandle) -> Self {
         Self {
             handle,
-            deadline: Instant::now() + DEADLINE,
+            deadline: Some(Instant::now() + DEADLINE),
         }
+    }
+
+    pub(super) fn wait_for_consent(&mut self) {
+        self.deadline = None;
+    }
+
+    pub(super) fn restart_deadline(&mut self) {
+        self.deadline = Some(Instant::now() + DEADLINE);
     }
 
     pub(super) fn connect(&self) -> io::Result<()> {
@@ -198,10 +206,16 @@ impl Channel {
         connect: bool,
         operate: impl FnOnce(HANDLE, *mut OVERLAPPED) -> i32,
     ) -> io::Result<usize> {
-        let pending_for = self.deadline.saturating_duration_since(Instant::now());
-        if pending_for.is_zero() {
-            return Err(io::ErrorKind::TimedOut.into());
-        }
+        let milliseconds = match self.deadline {
+            Some(deadline) => {
+                deadline
+                    .checked_duration_since(Instant::now())
+                    .ok_or(io::ErrorKind::TimedOut)?
+                    .as_millis() as u32
+                    + 1
+            }
+            None => INFINITE,
+        };
         let event = owned(unsafe { CreateEventW(null(), 1, 0, null()) })?;
         let handle = self.handle.as_raw_handle();
         let mut state = OVERLAPPED {
@@ -217,7 +231,6 @@ impl Channel {
             if code != Some(ERROR_IO_PENDING) {
                 return Err(error);
             }
-            let milliseconds = pending_for.as_millis() as u32 + 1;
             let waited = unsafe { WaitForSingleObject(event.as_raw_handle(), milliseconds) };
             if waited != WAIT_OBJECT_0 {
                 let error = if waited == WAIT_TIMEOUT {

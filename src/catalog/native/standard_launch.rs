@@ -52,7 +52,7 @@ fn standard_action(source: &Source, operation: Operation) -> Result<(), String> 
         return Err(tr(Msg::LaunchUnsupported).into());
     }
     let desktop = StandardDesktop::find(current.session).map_err(unavailable)?;
-    let (channel, id) = Channel::server(&desktop.context).map_err(unavailable)?;
+    let (mut channel, id) = Channel::server(&desktop.context).map_err(unavailable)?;
     let executable = std::env::current_exe().map_err(unavailable)?;
     desktop
         .start_worker(&executable, &id)
@@ -64,9 +64,7 @@ fn standard_action(source: &Source, operation: Operation) -> Result<(), String> 
             "the launch worker does not have the verified standard token",
         ));
     }
-    if matches!(operation, Operation::Reveal) {
-        worker.allow_foreground();
-    }
+    worker.allow_foreground();
     channel
         .send(&Request {
             operation,
@@ -74,6 +72,10 @@ fn standard_action(source: &Source, operation: Operation) -> Result<(), String> 
             language: i18n::current(),
         })
         .map_err(unavailable)?;
+    if matches!(operation, Operation::Launch) {
+        // The verified worker can be waiting for the user's UAC decision.
+        channel.wait_for_consent();
+    }
     channel.receive().map_err(unavailable)?
 }
 
@@ -84,7 +86,7 @@ pub fn worker(id: &str) -> Result<(), String> {
             "the launch worker is not running with a standard token",
         ));
     }
-    let channel = Channel::client(id).map_err(unavailable)?;
+    let mut channel = Channel::client(id).map_err(unavailable)?;
     let caller = channel.peer(false).map_err(unavailable)?;
     if caller.session().map_err(unavailable)? != current.session {
         return Err(standard_error(
@@ -97,6 +99,7 @@ pub fn worker(id: &str) -> Result<(), String> {
         let _apartment = Apartment::enter().map_err(|error| standard_error(&error.to_string()))?;
         execute(&request.source, request.operation)
     })();
+    channel.restart_deadline();
     channel.send(&response).map_err(unavailable)
 }
 
@@ -108,7 +111,9 @@ fn execute(source: &Source, operation: Operation) -> Result<(), String> {
     }
     match source {
         Source::Desktop(path) if executable_path(path).is_some() => {
-            create_process(path, OsStr::new(""), None, None)
+            launch_executable(path, OsStr::new(""), None, None, || {
+                super::elevate_desktop(path)
+            })
         }
         Source::Desktop(path)
             if path
@@ -117,17 +122,27 @@ fn execute(source: &Source, operation: Operation) -> Result<(), String> {
         {
             let (executable, arguments) = super::internet_shortcut::direct_target(path)
                 .ok_or_else(|| tr(Msg::LaunchUnsupported).to_owned())?;
-            create_process(&executable, &arguments, None, None)
+            create_process(&executable, &arguments, None, None).map_err(|error| {
+                if error.raw_os_error() == Some(ERROR_ELEVATION_REQUIRED as i32) {
+                    tr(Msg::LaunchElevationRequired).into()
+                } else {
+                    error.to_string()
+                }
+            })
         }
         Source::Desktop(path) => match shortcut::for_standard_launch(path) {
             Some(LaunchTarget::Desktop {
-                path,
+                path: target,
                 arguments,
                 directory,
                 show,
-            }) => create_process(&path, &arguments, directory.as_deref(), show),
+            }) => launch_executable(&target, &arguments, directory.as_deref(), show, || {
+                super::elevate_desktop(path)
+            }),
             Some(LaunchTarget::Package(id)) => activate_package(&id),
-            Some(LaunchTarget::RequiresElevation) => Err(tr(Msg::LaunchElevationRequired).into()),
+            Some(LaunchTarget::RequiresElevation) => {
+                super::elevate_desktop(path).map_err(|error| error.to_string())
+            }
             None => Err(tr(Msg::LaunchUnsupported).into()),
         },
         Source::Packaged(id) => activate_package(id),
@@ -141,18 +156,38 @@ fn activate_package(id: &str) -> Result<(), String> {
     launch_packaged(id).map_err(|error| error.to_string())
 }
 
+fn launch_executable(
+    target: &Path,
+    arguments: &OsStr,
+    directory: Option<&Path>,
+    show: Option<u16>,
+    request_elevation: impl FnOnce() -> io::Result<()>,
+) -> Result<(), String> {
+    create_process(target, arguments, directory, show)
+        .or_else(|error| {
+            if error.raw_os_error() == Some(ERROR_ELEVATION_REQUIRED as i32) {
+                // The selected shortcut retains its arguments and working
+                // directory when Windows presents the application's UAC prompt.
+                request_elevation()
+            } else {
+                Err(error)
+            }
+        })
+        .map_err(|error| error.to_string())
+}
+
 fn create_process(
     path: &Path,
     arguments: &OsStr,
     directory: Option<&Path>,
     show: Option<u16>,
-) -> Result<(), String> {
+) -> io::Result<()> {
     let executable: Vec<_> = path.as_os_str().encode_wide().collect();
     if executable
         .iter()
         .any(|&unit| unit == 0 || unit == u16::from(b'"'))
     {
-        return Err(tr(Msg::LaunchUnsupported).into());
+        return Err(io::Error::other(tr(Msg::LaunchUnsupported)));
     }
     let mut command = Vec::with_capacity(executable.len() + 32);
     command.push(u16::from(b'"'));
@@ -163,7 +198,7 @@ fn create_process(
         command.extend(arguments.encode_wide());
     }
     if command.len() >= 32767 || command.contains(&0) {
-        return Err(tr(Msg::LaunchUnsupported).into());
+        return Err(io::Error::other(tr(Msg::LaunchUnsupported)));
     }
     command.push(0);
     let mut executable = executable;
@@ -200,14 +235,7 @@ fn create_process(
         )
     };
     if started == 0 {
-        let error = io::Error::last_os_error();
-        return Err(
-            if error.raw_os_error() == Some(ERROR_ELEVATION_REQUIRED as i32) {
-                tr(Msg::LaunchElevationRequired).into()
-            } else {
-                error.to_string()
-            },
-        );
+        return Err(io::Error::last_os_error());
     }
     unsafe {
         CloseHandle(process.hThread);
@@ -222,4 +250,37 @@ fn unavailable(error: io::Error) -> String {
 
 fn standard_error(detail: &str) -> String {
     render(Msg::LaunchStandardUnavailable, &[("detail", detail)])
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn missing_program_does_not_request_elevation() {
+        let missing = std::env::temp_dir()
+            .join("Rustart.Missing.Probe")
+            .join("missing.exe");
+        assert!(
+            launch_executable(&missing, OsStr::new(""), None, None, || {
+                panic!("an ordinary launch error requested elevation")
+            })
+            .is_err()
+        );
+    }
+
+    #[test]
+    #[ignore = "requires a standard token and RUSTART_TEST_ADMIN_EXE with a requireAdministrator manifest"]
+    fn manifest_requiring_elevation_routes_to_the_consent_prompt() {
+        let executable =
+            std::path::PathBuf::from(std::env::var_os("RUSTART_TEST_ADMIN_EXE").unwrap());
+        assert!(privilege::current().unwrap().standard());
+        let mut requested = false;
+        launch_executable(&executable, OsStr::new(""), None, None, || {
+            requested = true;
+            Ok(())
+        })
+        .unwrap();
+        assert!(requested);
+    }
 }
